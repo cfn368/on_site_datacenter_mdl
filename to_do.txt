@@ -1,0 +1,9 @@
+
+1.  Get VE data. I need:
+    PV, WL, wp
+    assumption: market can always serve
+
+2.  Need costs for cap, O&M and area
+
+3.  Build model. Will be harder for VE due to intertemporal storage
+    -   Adaptabe to different shares of net access
