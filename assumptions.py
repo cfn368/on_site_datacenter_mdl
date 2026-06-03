@@ -3,7 +3,6 @@
 Cost and technical assumptions for the KK_datacentre model.
 Sources tagged inline:
   [ET]  — Erhvervslivets Tænketank
-  [FOA] — Finansiel Omstilling i Atomsektoren (or similar ET reference)
   [DEA] — Danish Energy Agency, Technology Data (2030-column values for VE)
 """
 from model import Tech, Battery, DatacenterDemand

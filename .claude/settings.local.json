@@ -7,7 +7,8 @@
       "PowerShell(python -c \"import json; nb=json.load\\(open\\(r'c:\\\\Users\\\\LinusLindquist\\\\e-tank\\\\E-Tank - Data\\\\PROJEKTER\\\\04 KERNEKRAFT\\\\KK_datacentre\\\\1_VE.ipynb'\\)\\); [print\\(i, c['cell_type'], repr\\(c['source'][0] if c['source'] else ''\\)\\) for i, c in enumerate\\(nb['cells']\\)]\")",
       "PowerShell(python \"c:\\\\Users\\\\LinusLindquist\\\\e-tank\\\\E-Tank - Data\\\\PROJEKTER\\\\04 KERNEKRAFT\\\\KK_datacentre\\\\_add_trim_cell.py\")",
       "PowerShell(python -c \"import json; nb=json.load\\(open\\(r'c:\\\\Users\\\\LinusLindquist\\\\e-tank\\\\E-Tank - Data\\\\PROJEKTER\\\\04 KERNEKRAFT\\\\KK_datacentre\\\\1_VE.ipynb'\\)\\); print\\(json.dumps\\(nb.get\\('metadata',{}\\), indent=2\\)\\)\")",
-      "PowerShell(python \"c:\\\\Users\\\\LinusLindquist\\\\e-tank\\\\E-Tank - Data\\\\PROJEKTER\\\\04 KERNEKRAFT\\\\KK_datacentre\\\\_patch.py\")"
+      "PowerShell(python \"c:\\\\Users\\\\LinusLindquist\\\\e-tank\\\\E-Tank - Data\\\\PROJEKTER\\\\04 KERNEKRAFT\\\\KK_datacentre\\\\_patch.py\")",
+      "Bash(python -c \"import json; nb=json.load\\(open\\('c:/Users/LinusLindquist/e-tank/E-Tank - Data/PROJEKTER/04 KERNEKRAFT/KK_datacentre/2_model.ipynb'\\)\\); [print\\(c['id'], '|', c['source'][:200] if c['source'] else ''\\) for c in nb['cells'][:6]]\")"
     ],
     "additionalDirectories": [
       "c:\\Users\\LinusLindquist\\e-tank\\E-Tank - Data\\PROJEKTER\\04 KERNEKRAFT\\KK_datacentre"
