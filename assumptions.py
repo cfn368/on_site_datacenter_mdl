@@ -4,7 +4,7 @@ Cost and technical assumptions for the KK_datacentre model.
 Sources tagged inline:
   [ET]  — Erhvervslivets Tænketank
   [FOA] — Finansiel Omstilling i Atomsektoren (or similar ET reference)
-  [DEA] — Danish Energy Agency, Technology Data 2024 (2025-column values)
+  [DEA] — Danish Energy Agency, Technology Data (2030-column values for VE)
 """
 from model import Tech, Battery, DatacenterDemand
 
@@ -33,32 +33,32 @@ SMR_CF = 9 / 10   # technical capacity factor; affects fuel cost only in v0  [ET
 # ── solar PV (utility-scale) ──────────────────────────────────────────────────
 
 solar_tech = Tech(
-    capex         = 620_000,   # €/MW  [DEA 2024, 2025]
-    opex_fixed    = 9_000,     # €/MW/yr  [DEA 2024]
+    capex         = 450_000,   # €/MW  [DEA 2030]
+    opex_fixed    = 10_400,    # €/MW/yr  [DEA 2030]
     opex_var      = 0,         # €/MWh
-    lifetime      = 30,        # years
+    lifetime      = 40,        # years
     discount_rate = DISCOUNT_RATE,
 )
 
 # ── onshore wind ──────────────────────────────────────────────────────────────
 
 wind_tech = Tech(
-    capex         = 1_150_000,   # €/MW  [DEA 2024, 2025]
-    opex_fixed    = 18_000,      # €/MW/yr  [DEA 2024]
-    opex_var      = 2.5,         # €/MWh  [DEA 2024]
+    capex         = 1_150_000,   # €/MW  [DEA 2030]
+    opex_fixed    = 16_663,      # €/MW/yr  [DEA 2030]
+    opex_var      = 1.98,        # €/MWh  [DEA 2030]
     lifetime      = 30,          # years
     discount_rate = DISCOUNT_RATE,
 )
 
-# ── battery BESS (4 h duration) ───────────────────────────────────────────────
+# ── battery BESS ─────────────────────────────────────────────────────────────
+# Power (MW) and energy (MWh) are sized independently by the optimiser.
 
 battery = Battery(
-    capex_power   = 100_000,   # €/MW  (inverter + BOS)  [DEA 2024, 2025]
-    capex_energy  = 200_000,   # €/MWh (cells)  [DEA 2024, 2025]
-    opex_fixed    = 7_000,     # €/MW/yr  [DEA 2024]
-    lifetime      = 15,        # years
+    capex_power   = 80_000,    # €/MW  (power component)  [DEA 2030]
+    capex_energy  = 200_000,   # €/MWh (energy + other project costs)  [DEA 2030]
+    opex_fixed    = 8_100,     # €/MW/yr  [DEA 2030]
+    lifetime      = 20,        # years  [DEA 2030]
     discount_rate = DISCOUNT_RATE,
-    storage_hours = 24,
 )
 
 # ── demand ────────────────────────────────────────────────────────────────────
