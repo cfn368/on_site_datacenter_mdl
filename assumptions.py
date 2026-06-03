@@ -58,7 +58,7 @@ battery = Battery(
     opex_fixed    = 7_000,     # €/MW/yr  [DEA 2024]
     lifetime      = 15,        # years
     discount_rate = DISCOUNT_RATE,
-    storage_hours = 4,
+    storage_hours = 24,
 )
 
 # ── demand ────────────────────────────────────────────────────────────────────

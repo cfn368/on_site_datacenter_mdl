@@ -1,2 +1,4 @@
 eds_cache
 .claude
+__pycache__
+to_do.txt
