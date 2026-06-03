@@ -10,6 +10,8 @@ Layer 4 — DatacenterModel  : assembles layers, runs comparison.
 """
 from __future__ import annotations
 from dataclasses import dataclass
+import json
+import pathlib
 import numpy as np
 
 
@@ -320,6 +322,25 @@ class VESupply:
         if batt_energy is None:
             raise RuntimeError("Optimised VE solution is infeasible — raise bisect_upper_energy.")
         return c_solar, c_wind, batt_power, batt_energy
+
+    # ── persistence ──────────────────────────────────────────────────────────
+
+    def save(self, path: str | pathlib.Path = 'runs/ve_solution.json') -> None:
+        """Save optimised solution to JSON (runs optimiser first if needed)."""
+        c_solar, c_wind, batt_power, batt_energy = self.solution
+        p = pathlib.Path(path)
+        p.parent.mkdir(exist_ok=True)
+        p.write_text(json.dumps({
+            'c_solar':     c_solar,
+            'c_wind':      c_wind,
+            'batt_power':  batt_power,
+            'batt_energy': batt_energy,
+        }, indent=2))
+
+    def load(self, path: str | pathlib.Path = 'runs/ve_solution.json') -> None:
+        """Load a previously saved solution, bypassing the optimiser."""
+        d = json.loads(pathlib.Path(path).read_text())
+        self._solution = (d['c_solar'], d['c_wind'], d['batt_power'], d['batt_energy'])
 
     # ── public interface ──────────────────────────────────────────────────────
 

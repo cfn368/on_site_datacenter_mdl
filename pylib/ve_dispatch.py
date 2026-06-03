@@ -26,11 +26,11 @@ MAANED_DK = ['Jan', 'Feb', 'Mar', 'Apr', 'Maj', 'Jun',
              'Jul', 'Aug', 'Sep', 'Okt', 'Nov', 'Dec']
 
 DISPATCH_COLORS = {
-    'grid':     '#CCCCCC',
-    'battery':  '#DE7626',   # orange
-    'wind':     '#38BDF8',   # sky blue
-    'pv':       '#F5C518',   # golden
-    'exported': '#34BA5B',   # green
+    'grid':     '#C9C0B8',   # warm light grey  — grid import
+    'battery':  '#C0504D',   # brick red         — battery discharge
+    'wind':     '#5B9BD5',   # cornflower blue   — wind
+    'pv':       '#F2C94C',   # amber gold        — solar
+    'exported': '#8C7B72',   # warm medium grey  — grid export (same family as import)
 }
 
 

@@ -1,3 +1,6 @@
 1.  markets can always serve Q = 1-x
 2.  markets can always buy   Q = 1-x
 
+
+To-do
+-   Should remove a lot of stuff from cache
