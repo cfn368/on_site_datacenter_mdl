@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 __all__ = [
     'MAANED_DK', 'DISPATCH_COLORS',
     'dispatch_detail', 'aggregate_dispatch', 'plot_dispatch',
+    'battery_detail', 'plot_battery',
 ]
 
 
@@ -92,17 +93,68 @@ def aggregate_dispatch(d, dates, freq):
     return {k: agg[k].values for k in d}, agg.index
 
 
+def battery_detail(ve, solar_cf, wind_cf):
+    """
+    Hour-by-hour battery flows and end-of-hour state of charge.
+    Returns dict: charge, discharge_dc, discharge_grid (MW), soc (MWh).
+    discharge_grid is zero in the current model (battery cannot export directly).
+    """
+    c_solar, c_wind, batt_power, batt_energy = ve.solution
+    floor = ve.demand.floor_mw
+    H     = ve.demand.HOURS
+
+    avail = c_solar * solar_cf + c_wind * wind_cf
+
+    charge         = np.zeros(H)
+    discharge_dc   = np.zeros(H)
+    discharge_grid = np.zeros(H)   # reserved for future battery-to-grid dispatch
+    soc_arr        = np.zeros(H)
+    soc = 0.0
+
+    for t in range(H):
+        a = avail[t]
+        if a >= floor:
+            ch        = min(a - floor, batt_power, batt_energy - soc)
+            soc      += ch
+            charge[t] = ch
+        else:
+            dis             = min(floor - a, batt_power, soc)
+            soc            -= dis
+            discharge_dc[t] = dis
+        soc_arr[t] = soc
+
+    return dict(charge=charge, discharge_dc=discharge_dc,
+                discharge_grid=discharge_grid, soc=soc_arr)
+
+
 # ==================== ==================== ==================== ====================
 # 2. plotting
 
+def _align_zeros(ax1, ax2):
+    """Expand lower limits so zero sits at the same fractional height on both axes."""
+    lo1, hi1 = ax1.get_ylim()
+    lo2, hi2 = ax2.get_ylim()
+    f1 = (0 - lo1) / (hi1 - lo1) if hi1 != lo1 else 0.5
+    f2 = (0 - lo2) / (hi2 - lo2) if hi2 != lo2 else 0.5
+    f  = max(f1, f2)
+    if 0 < f < 1:
+        ax1.set_ylim(-f * hi1 / (1 - f), hi1)
+        ax2.set_ylim(-f * hi2 / (1 - f), hi2)
+
+
 def _month_ticks(idx):
-    """First position of each calendar month in idx, with Danish labels."""
+    """Midpoint of each calendar month's first contiguous block, with Danish labels."""
     ticks, labels = [], []
     for m in range(1, 13):
         pos = np.where(idx.month == m)[0]
-        if len(pos):
-            ticks.append(pos[0])
-            labels.append(MAANED_DK[m - 1])
+        if not len(pos):
+            continue
+        # drop year-boundary tail (weekly data: Jan appears at both ends of the array)
+        gaps = np.where(np.diff(pos) > 1)[0]
+        if len(gaps):
+            pos = pos[:gaps[0] + 1]
+        ticks.append((pos[0] + pos[-1]) // 2)
+        labels.append(MAANED_DK[m - 1])
     return ticks, labels
 
 
@@ -113,7 +165,7 @@ def plot_dispatch(d_agg, idx, ylabel, save_path=None):
     """
     x = np.arange(len(idx))
     C = DISPATCH_COLORS
-    fig, ax = plt.subplots(figsize=(12, 5))
+    fig, ax = plt.subplots(figsize=(12, 6))
 
     ax.stackplot(
         x,
@@ -125,21 +177,64 @@ def plot_dispatch(d_agg, idx, ylabel, save_path=None):
     ax.fill_between(x, 0, -d_agg['exported'],
                     label='Eksport', color=C['exported'], linewidth=0)
 
-    ax.axhline(0, color='0.2', lw=0.8, ls='--')
     ax.set_xlim(0, len(idx) - 1)
     ax.set_ylabel(ylabel)
-    ax.grid(linewidth=0.6, alpha=0.35)
 
     ticks, labs = _month_ticks(idx)
     ax.set_xticks(ticks)
     ax.set_xticklabels(labs)
 
     handles, labels = ax.get_legend_handles_labels()
-    ax.legend(handles[::-1], labels[::-1], loc='lower left', frameon=True)
+    ax.legend(handles[::-1], labels[::-1],
+              loc='upper center', bbox_to_anchor=(0.5, -0.12),
+              ncol=len(labels))
 
     plt.tight_layout()
     if save_path:
         pathlib.Path(save_path).parent.mkdir(exist_ok=True)
-        plt.savefig(save_path, dpi=300)
+        plt.savefig(save_path)
     plt.show()
     return fig, ax
+
+
+def plot_battery(b, idx, save_path=None):
+    """
+    Single-figure battery plot with twin y-axes.
+    Left: state of charge (MWh, blue fill). Right: charge/discharge (MW, fills).
+    """
+    C = DISPATCH_COLORS
+    x = np.arange(len(idx))
+
+    fig, ax_soc = plt.subplots(figsize=(12, 6))
+    ax_flow = ax_soc.twinx()
+
+    ax_soc.fill_between(x, 0, b['soc'] / 1e3,
+                        color=C['wind'], alpha=0.35, linewidth=0, label='SOC')
+    ax_soc.set_ylabel('GWh stored')
+    ax_soc.set_xlim(0, len(idx) - 1)
+
+    ax_flow.fill_between(x, 0, b['charge'],
+                         color='#E8A09E', linewidth=0, label='Charge')
+    ax_flow.fill_between(x, 0, -b['discharge_dc'],
+                         color='#C0504D', linewidth=0, label='Discharge — datacenter')
+    ax_flow.fill_between(x, -b['discharge_dc'], -b['discharge_dc'] - b['discharge_grid'],
+                         color='#1A1A1A', linewidth=0, label='Discharge — grid')
+    ax_flow.set_ylabel('MW')
+
+    ticks, labs = _month_ticks(idx)
+    ax_soc.set_xticks(ticks)
+    ax_soc.set_xticklabels(labs)
+
+    h1, l1 = ax_soc.get_legend_handles_labels()
+    h2, l2 = ax_flow.get_legend_handles_labels()
+    ax_soc.legend(h1 + h2[::-1], l1 + l2[::-1],
+                  loc='upper center', bbox_to_anchor=(0.5, -0.12),
+                  ncol=len(h1) + len(h2))
+
+    _align_zeros(ax_soc, ax_flow)
+    plt.tight_layout()
+    if save_path:
+        pathlib.Path(save_path).parent.mkdir(exist_ok=True)
+        plt.savefig(save_path)
+    plt.show()
+    return fig, (ax_soc, ax_flow)

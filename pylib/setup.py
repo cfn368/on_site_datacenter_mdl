@@ -36,19 +36,35 @@ def enable_autoreload(mode: int = 2) -> None:
     ip.run_line_magic("autoreload", str(int(mode)))
 
 
-def set_style() -> None:
+def set_aej(**kwargs) -> None:
     mpl.rcParams.update({
-        'figure.dpi':        150,
-        'savefig.dpi':       300,
-        'font.size':         10,
-        'axes.labelsize':    10,
-        'legend.fontsize':   9,
-        'axes.spines.top':   False,
-        'axes.spines.right': False,
+        "font.family":          "serif",
+        "font.style":           "italic",
+        "font.size":            15,
+        "figure.dpi":           150,
+        "figure.facecolor":     "#EAF1F2",
+        "axes.facecolor":       "#EAF1F2",
+        "axes.linewidth":       1.0,
+        "axes.spines.top":      False,
+        "axes.spines.right":    False,
+        "axes.spines.left":     False,
+        "axes.spines.bottom":   False,
+        "lines.linewidth":      1.2,
+        "xtick.direction":      "out",
+        "ytick.direction":      "out",
+        "legend.frameon":       False,
+        "legend.fancybox":      False,
+        "legend.borderaxespad": 0.4,
+        "legend.handlelength":  2.0,
+        "legend.handletextpad": 0.6,
+        "legend.labelspacing":  0.35,
+        "savefig.bbox":         "tight",
+        "savefig.dpi":          300,
+        **kwargs,
     })
 
 
-def setup_notebook(*, autoreload: int = 2) -> None:
+def setup_notebook(*, autoreload: int = 2, aej: bool = True, **aej_kwargs) -> None:
     """Enable autoreload, set figure style, reload pylib modules, inject names into caller."""
     import inspect
 
@@ -69,4 +85,5 @@ def setup_notebook(*, autoreload: int = 2) -> None:
         'pathlib': pathlib, 'time': time, 'sys': sys,
     })
 
-    set_style()
+    if aej:
+        set_aej(**aej_kwargs)
