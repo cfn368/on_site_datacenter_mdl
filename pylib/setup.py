@@ -23,6 +23,10 @@ import matplotlib.ticker as mticker
 import pylib.ve_dispatch
 from pylib.ve_dispatch import *   # noqa: F401, F403
 
+# Dark shade of the figure facecolor (#EAF1F2, HSL≈188° 23% 93%)
+# — same hue, much lower lightness; used as the global text colour.
+TEXT_COLOR = "#3F6469"
+
 
 def enable_autoreload(mode: int = 2) -> None:
     try:
@@ -49,6 +53,10 @@ def set_aej(**kwargs) -> None:
         "axes.spines.right":    False,
         "axes.spines.left":     False,
         "axes.spines.bottom":   False,
+        "text.color":           TEXT_COLOR,
+        "axes.labelcolor":      TEXT_COLOR,
+        "xtick.color":          TEXT_COLOR,
+        "ytick.color":          TEXT_COLOR,
         "lines.linewidth":      1.2,
         "xtick.direction":      "out",
         "ytick.direction":      "out",
@@ -83,6 +91,7 @@ def setup_notebook(*, autoreload: int = 2, aej: bool = True, **aej_kwargs) -> No
         'np': np, 'pd': pd, 'plt': plt,
         'mpl': mpl, 'mticker': mticker,
         'pathlib': pathlib, 'time': time, 'sys': sys,
+        'TEXT_COLOR': TEXT_COLOR,
     })
 
     if aej:

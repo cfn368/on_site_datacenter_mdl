@@ -38,13 +38,34 @@ DISPATCH_COLORS = {
 # ==================== ==================== ==================== ====================
 # 1. dispatch
 
+def _dispatch_from_lp(lp: dict, demand_mw: float) -> dict:
+    """LP-consistent demand attribution from cached LP arrays."""
+    ve_gen         = lp['pv_gen'] + lp['wl_gen']
+    discharge_grid = np.minimum(lp['discharge'], lp['grid_sell'])
+    batt_to_demand = lp['discharge'] - discharge_grid
+    grid_to_demand = lp['grid_buy']
+    ve_to_demand   = demand_mw - batt_to_demand - grid_to_demand
+    frac_pv        = np.where(ve_gen > 1e-9, lp['pv_gen'] / ve_gen, 0.0)
+    return dict(
+        pv       = ve_to_demand * frac_pv,
+        wind     = ve_to_demand * (1.0 - frac_pv),
+        battery  = batt_to_demand,
+        grid     = grid_to_demand,
+        exported = lp['grid_sell'],
+    )
+
+
 def dispatch_detail(ve, solar_cf, wind_cf):
     """
     Hour-by-hour component breakdown: pv, wind, battery, grid, exported (MW).
-    Always uses greedy dispatch replay on the optimised capacities. When ve uses
-    LP dispatch, the timing of battery cycles will differ from the actual LP
-    solution; total annual flows are representative.
+    Uses LP dispatch arrays when ve.lp_detail() is cached (LP path); falls back
+    to greedy replay on the optimised capacities otherwise.
     """
+    lp = ve.lp_detail() if ve.prices is not None else None
+    if lp is not None:
+        return _dispatch_from_lp(lp, ve.demand.demand_mw)
+
+    # greedy fallback
     c_solar, c_wind, batt_power, batt_energy = ve.solution
     floor     = ve.demand.floor_mw
     demand_mw = ve.demand.demand_mw

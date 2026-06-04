@@ -236,6 +236,7 @@ class VESupply:
         self.tol_energy          = tol_energy
         self.tol_ve              = tol_ve
         self._solution: tuple[float, float, float, float] | None = None  # (c_solar, c_wind, batt_power, batt_energy)
+        self._lp_cache: dict | None = None
 
     # ── simulation ────────────────────────────────────────────────────────────
 
@@ -469,6 +470,34 @@ class VESupply:
         d = json.loads(pathlib.Path(path).read_text())
         self._solution = (d['c_solar'], d['c_wind'], d['batt_power'], d['batt_energy'])
 
+    def save_lp_arrays(self, path: str | pathlib.Path = 'runs/ve_lp_arrays.npz') -> None:
+        """Save LP dispatch arrays to npz. Runs the LP if not already cached."""
+        lp = self.lp_detail()
+        if lp is None:
+            raise RuntimeError("No prices set — LP arrays not available.")
+        p = pathlib.Path(path)
+        p.parent.mkdir(exist_ok=True)
+        save_keys = ['charge', 'discharge', 'soc', 'grid_buy', 'grid_sell',
+                     'curtail', 'cfe_excess', 'pv_gen', 'wl_gen']
+        np.savez(str(p), **{k: lp[k] for k in save_keys})
+
+    def load_lp_arrays(self, path: str | pathlib.Path = 'runs/ve_lp_arrays.npz') -> None:
+        """Load LP dispatch arrays from npz, bypassing the LP re-solve."""
+        data = np.load(str(pathlib.Path(path)))
+        self._lp_cache = {k: data[k] for k in data.files}
+
+    def save_lp_txt(self, directory: str | pathlib.Path = 'runs/lp_arrays') -> None:
+        """Save LP dispatch arrays as individual txt files (one value per line)."""
+        lp = self.lp_detail()
+        if lp is None:
+            raise RuntimeError("No prices set — LP arrays not available.")
+        d = pathlib.Path(directory)
+        d.mkdir(parents=True, exist_ok=True)
+        save_keys = ['charge', 'discharge', 'soc', 'grid_buy', 'grid_sell',
+                     'curtail', 'cfe_excess', 'pv_gen', 'wl_gen']
+        for k in save_keys:
+            np.savetxt(str(d / f'{k}.txt'), lp[k], fmt='%.4f')
+
     # ── public interface ──────────────────────────────────────────────────────
 
     @property
@@ -502,10 +531,17 @@ class VESupply:
 
     def lp_detail(self) -> dict | None:
         """All LP dispatch arrays for the optimised solution. None if no prices."""
+        if self._lp_cache is not None:
+            return self._lp_cache
         if self.prices is None:
             return None
         c_solar, c_wind, batt_power, batt_energy = self.solution
-        return self._lp_solve(c_solar, c_wind, batt_power, batt_energy)
+        result = self._lp_solve(c_solar, c_wind, batt_power, batt_energy)
+        if result is not None:
+            result['pv_gen'] = c_solar * self.solar_cf
+            result['wl_gen'] = c_wind * self.wind_cf
+        self._lp_cache = result
+        return result
 
     def annual_onsite_cost(self) -> float:
         c_solar, c_wind, batt_power, batt_energy = self.solution
