@@ -75,6 +75,8 @@ class Result:
     batt_energy_mwh:         float = 0.0  # VE only
     annual_export_revenue:   float = 0.0  # VE only (€/yr, spot price × exported MWh)
     cfe_shortfall_mwh:       float = 0.0  # VE only (MWh/yr floor unmet; 0 = fully feasible)
+    annual_tariff_cost:      float = 0.0  # VE only (grid consumption + production tariffs)
+    annual_grid_connect:     float = 0.0  # VE only (annualised tilslutningsbidrag)
 
     def __repr__(self) -> str:
         if self.label == "KK":
@@ -155,35 +157,61 @@ class KKSupply:
     capacity_factor affects fuel cost (annual generation) only; dispatch stays
     constant at floor_mw (100% availability assumed in v0).
     """
-    def __init__(self, tech: Tech, demand: DatacenterDemand, capacity_factor: float = 1.0):
-        self.tech = tech
-        self.demand = demand
-        self.capacity_factor = capacity_factor
+    def __init__(self, tech: Tech, demand: DatacenterDemand, prices: np.ndarray,
+                 downtime_fraction: float = 0.10, buy_tariff: float = 0.0,
+                 grid_connect_annual: float = 0.0):
+        self.tech                = tech
+        self.demand              = demand
+        self.prices              = prices
+        self.downtime_fraction   = downtime_fraction
+        self.buy_tariff          = buy_tariff
+        self.grid_connect_annual = grid_connect_annual
+        self._outage: np.ndarray | None = None
 
     @property
     def capacity_mw(self) -> float:
-        return self.demand.demand_mw / self.capacity_factor
+        return self.demand.demand_mw
+
+    @property
+    def downtime_hours(self) -> int:
+        return round(self.downtime_fraction * self.demand.HOURS)
+
+    def _outage_mask(self) -> np.ndarray:
+        """Contiguous downtime window placed at the cheapest hours (min spot + tariff)."""
+        if self._outage is None:
+            n = self.downtime_hours
+            cum = np.concatenate([[0.0], np.cumsum(self.prices + self.buy_tariff)])
+            start = int(np.argmin(cum[n:] - cum[:-n]))
+            self._outage = np.zeros(self.demand.HOURS, dtype=bool)
+            self._outage[start : start + n] = True
+        return self._outage
 
     def dispatch(self) -> np.ndarray:
-        return np.full(self.demand.HOURS, self.capacity_mw)
+        d = np.full(self.demand.HOURS, self.capacity_mw)
+        d[self._outage_mask()] = 0.0
+        return d
 
     def annual_cost(self) -> float:
-        generation_mwh = self.capacity_mw * self.capacity_factor * self.demand.HOURS
+        generation_mwh = self.capacity_mw * (self.demand.HOURS - self.downtime_hours)
         return self.tech.annual_cost(self.capacity_mw, generation_mwh)
 
     def result(self, grid: GridSupply) -> Result:
-        d = self.dispatch()
-        onsite_cost = self.annual_cost()
-        grid_cost   = grid.cost(d)
-        total       = onsite_cost + grid_cost
+        outage          = self._outage_mask()
+        onsite_cost     = self.annual_cost()
+        grid_import_mwh = float(self.capacity_mw * outage.sum())
+        grid_cost       = float((self.prices[outage] * self.capacity_mw).sum())
+        tariff_cost     = self.buy_tariff * grid_import_mwh
+        total           = onsite_cost + grid_cost + tariff_cost + self.grid_connect_annual
         return Result(
-            label              = "KK",
-            onsite_capacity_mw = self.capacity_mw,
-            annual_onsite_cost = onsite_cost,
-            annual_grid_cost   = grid_cost,
-            annual_total_cost  = total,
-            lcoe               = total / self.demand.annual_mwh,
-            grid_import_mwh    = float(grid.imports(d).sum()),
+            label               = "KK",
+            onsite_capacity_mw  = self.capacity_mw,
+            annual_onsite_cost  = onsite_cost,
+            annual_grid_cost    = grid_cost,
+            annual_total_cost   = total,
+            lcoe                = total / self.demand.annual_mwh,
+            grid_import_mwh     = grid_import_mwh,
+            annual_tariff_cost  = tariff_cost,
+            annual_grid_connect = self.grid_connect_annual,
         )
 
 
@@ -212,8 +240,11 @@ class VESupply:
         demand:              DatacenterDemand,
         prices:              np.ndarray | None = None,
         storage_hours:       float | None = None,   # None → free E_batt (bisection); set → fixed ratio
-        cfe_penalty:         float = 1e6,           # €/MWh penalty for CFE shortfall (storage_hours mode)
-        bisect_upper_energy: float = 1_000_000.0,  # MWh — ceiling for inner bisection
+        buy_tariff:          float = 0.0,            # €/MWh added to grid_buy cost in LP
+        sell_tariff:         float = 0.0,            # €/MWh deducted from grid_sell revenue in LP
+        grid_connect_annual: float = 0.0,            # €/yr annualised tilslutningsbidrag
+        cfe_penalty:         float = 1e6,            # €/MWh penalty for CFE shortfall (storage_hours mode)
+        bisect_upper_energy: float = 1_000_000.0,   # MWh — ceiling for inner bisection
         tol_energy:          float = 1.0,           # MWh — inner bisection tolerance
         tol_ve:              float = 1.0,           # MW  — outer Nelder-Mead tolerance
     ):
@@ -228,6 +259,9 @@ class VESupply:
         self.battery             = battery
         self.demand              = demand
         self.prices              = prices
+        self.buy_tariff          = buy_tariff
+        self.sell_tariff         = sell_tariff
+        self.grid_connect_annual = grid_connect_annual
         self.storage_hours       = storage_hours
         self.cfe_penalty         = cfe_penalty
         self.bisect_upper_energy = bisect_upper_energy
@@ -303,8 +337,8 @@ class VESupply:
         Z = csr_matrix((T, T))
         L = diags([np.ones(T), -np.ones(T - 1)], [0, -1], shape=(T, T), format='csr')
 
-        # objective: min Σ [price*(grid_buy - grid_sell) + M*cfe_excess]
-        c_obj = np.concatenate([np.zeros(3 * T), p, -p, np.zeros(T), np.full(T, M)])
+        # objective: min Σ [(price+buy_tariff)*grid_buy - (price-sell_tariff)*grid_sell + M*cfe_excess]
+        c_obj = np.concatenate([np.zeros(3 * T), p + self.buy_tariff, -p + self.sell_tariff, np.zeros(T), np.full(T, M)])
 
         # energy balance (equality): charge - discharge - grid_buy + grid_sell + curtail = ve - d
         A_en  = hstack([I, -I, Z, -I, I, I, Z], format='csr')
@@ -388,7 +422,7 @@ class VESupply:
                          (self.battery.capex_power + self.battery.capex_energy * sh)
                          * self.battery.crf + self.battery.opex_fixed]
 
-        c_obj = np.concatenate([cap_costs, np.zeros(3 * T), p, -p,
+        c_obj = np.concatenate([cap_costs, np.zeros(3 * T), p + self.buy_tariff, -p + self.sell_tariff,
                                  np.zeros(T), np.full(T, M)])
 
         # ── sparse blocks ─────────────────────────────────────────────────────
@@ -691,13 +725,16 @@ class VESupply:
             export_revenue  = float((grid_sell * np.maximum(grid.prices, 0.0)).sum())
             shortfall_mwh   = float(sol['cfe_excess'].sum())
             grid_import_mwh = float(grid_buy.sum())
+            grid_sell_mwh   = float(grid_sell.sum())
         else:
             onsite, sold, shortfall_mwh = self._simulate(c_solar, c_wind, batt_power, batt_energy)
             grid_cost       = grid.cost(onsite)
             export_revenue  = float((sold * np.maximum(grid.prices, 0.0)).sum())
             grid_import_mwh = float(grid.imports(onsite).sum())
+            grid_sell_mwh   = float(sold.sum())
 
-        total = onsite_cost + grid_cost - export_revenue
+        tariff_cost = self.buy_tariff * grid_import_mwh + self.sell_tariff * grid_sell_mwh
+        total = onsite_cost + grid_cost - export_revenue + tariff_cost + self.grid_connect_annual
         return Result(
             label                  = "VE",
             c_solar_mw             = c_solar,
@@ -712,6 +749,8 @@ class VESupply:
             lcoe                   = total / self.demand.annual_mwh,
             grid_import_mwh        = grid_import_mwh,
             cfe_shortfall_mwh      = shortfall_mwh,
+            annual_tariff_cost     = tariff_cost,
+            annual_grid_connect    = self.grid_connect_annual,
         )
 
 

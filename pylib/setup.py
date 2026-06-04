@@ -19,6 +19,7 @@ import pandas as pd
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
+import matplotlib.dates as mdates
 
 import pylib.ve_dispatch
 from pylib.ve_dispatch import *   # noqa: F401, F403
@@ -89,7 +90,7 @@ def setup_notebook(*, autoreload: int = 2, aej: bool = True, **aej_kwargs) -> No
         )
     caller_globals.update({
         'np': np, 'pd': pd, 'plt': plt,
-        'mpl': mpl, 'mticker': mticker,
+        'mpl': mpl, 'mticker': mticker, 'mdates': mdates,
         'pathlib': pathlib, 'time': time, 'sys': sys,
         'TEXT_COLOR': TEXT_COLOR,
     })

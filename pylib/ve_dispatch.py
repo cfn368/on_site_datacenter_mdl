@@ -32,6 +32,7 @@ DISPATCH_COLORS = {
     'wind':     '#5B9BD5',   # cornflower blue   — wind
     'pv':       '#F2C94C',   # amber gold        — solar
     'exported': '#8C7B72',   # warm medium grey  — grid export (same family as import)
+    'nuclear':  '#4472C4',   # steel blue        — nuclear on-site production
 }
 
 
