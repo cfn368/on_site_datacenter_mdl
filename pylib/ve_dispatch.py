@@ -41,7 +41,9 @@ DISPATCH_COLORS = {
 def dispatch_detail(ve, solar_cf, wind_cf):
     """
     Hour-by-hour component breakdown: pv, wind, battery, grid, exported (MW).
-    Replays VESupply greedy dispatch to decompose how demand is met each hour.
+    Always uses greedy dispatch replay on the optimised capacities. When ve uses
+    LP dispatch, the timing of battery cycles will differ from the actual LP
+    solution; total annual flows are representative.
     """
     c_solar, c_wind, batt_power, batt_energy = ve.solution
     floor     = ve.demand.floor_mw
@@ -97,17 +99,34 @@ def battery_detail(ve, solar_cf, wind_cf):
     """
     Hour-by-hour battery flows and end-of-hour state of charge.
     Returns dict: charge, discharge_dc, discharge_grid (MW), soc (MWh).
-    discharge_grid is zero in the current model (battery cannot export directly).
+
+    When ve.prices is set, uses LP dispatch arrays directly (battery is
+    bidirectional; discharge_grid = portion of discharge exported to grid).
+    Otherwise replays greedy dispatch.
     """
     c_solar, c_wind, batt_power, batt_energy = ve.solution
-    floor = ve.demand.floor_mw
-    H     = ve.demand.HOURS
+    H = ve.demand.HOURS
 
+    lp = ve.lp_detail() if ve.prices is not None else None
+
+    if lp is not None:
+        charge         = lp['charge']
+        discharge      = lp['discharge']
+        soc_arr        = lp['soc']
+        grid_sell      = lp['grid_sell']
+        # battery drives exports up to its own discharge; VE may also export
+        discharge_grid = np.minimum(discharge, grid_sell)
+        discharge_dc   = discharge - discharge_grid
+        return dict(charge=charge, discharge_dc=discharge_dc,
+                    discharge_grid=discharge_grid, soc=soc_arr)
+
+    # greedy replay
+    floor = ve.demand.floor_mw
     avail = c_solar * solar_cf + c_wind * wind_cf
 
     charge         = np.zeros(H)
     discharge_dc   = np.zeros(H)
-    discharge_grid = np.zeros(H)   # reserved for future battery-to-grid dispatch
+    discharge_grid = np.zeros(H)
     soc_arr        = np.zeros(H)
     soc = 0.0
 
@@ -200,7 +219,7 @@ def plot_dispatch(d_agg, idx, ylabel, save_path=None):
 def plot_battery(b, idx, save_path=None):
     """
     Single-figure battery plot with twin y-axes.
-    Left: state of charge (MWh, blue fill). Right: charge/discharge (MW, fills).
+    Left: state of charge (MWh, blue fill). Right: charge/discharge (MW, lines).
     """
     C = DISPATCH_COLORS
     x = np.arange(len(idx))
@@ -213,12 +232,9 @@ def plot_battery(b, idx, save_path=None):
     ax_soc.set_ylabel('GWh stored')
     ax_soc.set_xlim(0, len(idx) - 1)
 
-    ax_flow.fill_between(x, 0, b['charge'],
-                         color='#E8A09E', linewidth=0, label='Charge')
-    ax_flow.fill_between(x, 0, -b['discharge_dc'],
-                         color='#C0504D', linewidth=0, label='Discharge — datacenter')
-    ax_flow.fill_between(x, -b['discharge_dc'], -b['discharge_dc'] - b['discharge_grid'],
-                         color='#1A1A1A', linewidth=0, label='Discharge — grid')
+    ax_flow.plot(x, b['charge'],         color='#E8A09E', linewidth=1.5, label='Charge')
+    ax_flow.plot(x, b['discharge_dc'],   color='#C0504D', linewidth=1.5, label='Discharge — datacenter')
+    ax_flow.plot(x, b['discharge_grid'], color='#1A1A1A', linewidth=1.5, label='Discharge — grid')
     ax_flow.set_ylabel('MW')
 
     ticks, labs = _month_ticks(idx)

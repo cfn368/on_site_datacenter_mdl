@@ -74,6 +74,7 @@ class Result:
     batt_power_mw:       float = 0.0  # VE only
     batt_energy_mwh:         float = 0.0  # VE only
     annual_export_revenue:   float = 0.0  # VE only (€/yr, spot price × exported MWh)
+    cfe_shortfall_mwh:       float = 0.0  # VE only (MWh/yr floor unmet; 0 = fully feasible)
 
     def __repr__(self) -> str:
         if self.label == "KK":
@@ -84,11 +85,14 @@ class Result:
                 f"{self.c_wind_mw:.0f} MW wind + "
                 f"{self.batt_power_mw:.0f} MW / {self.batt_energy_mwh:.0f} MWh batt"
             )
-        return (
+        s = (
             f"{self.label} [{cap}] | "
             f"LCOE {self.lcoe:.2f} €/MWh | "
             f"total {self.annual_total_cost / 1e6:.1f} M€/yr"
         )
+        if self.cfe_shortfall_mwh > 0:
+            s += f" | CFE shortfall {self.cfe_shortfall_mwh:,.0f} MWh/yr"
+        return s
 
 
 # ── layer 1: demand ───────────────────────────────────────────────────────────
@@ -187,15 +191,18 @@ class KKSupply:
 
 class VESupply:
     """
-    Solar + wind + battery. Jointly optimises (C_solar, C_wind, P_batt) where
-    battery power and energy are sized independently.
+    Solar + wind + battery. Jointly optimises (C_solar, C_wind, P_batt).
 
-    Outer: Nelder-Mead over (C_solar, C_wind, P_batt), minimising total annual cost.
-    Inner: bisection on E_batt — minimum energy that makes each
-           (C_solar, C_wind, P_batt) triple feasible for the hourly on-site floor.
+    When prices are provided:
+      Outer: Nelder-Mead over (C_solar, C_wind, P_batt).
+      Inner: perfect-foresight LP over all 8760 hours (scipy HiGHS). Battery is
+             fully bidirectional — can charge from grid and discharge to grid.
+             CFE floor enforced as grid_buy[t] ≤ grid_cap_mw per hour.
 
-    Providing prices includes grid purchase cost in the outer objective so the
-    optimizer trades off larger VE against cheaper grid fills.
+    Without prices (no-price mode):
+      Greedy dispatch. Inner bisection on E_batt for feasibility.
+
+    storage_hours fixes E_batt = storage_hours × P_batt (removes inner bisection).
     """
     def __init__(
         self,
@@ -206,6 +213,8 @@ class VESupply:
         battery:             Battery,
         demand:              DatacenterDemand,
         prices:              np.ndarray | None = None,
+        storage_hours:       float | None = None,   # None → free E_batt (bisection); set → fixed ratio
+        cfe_penalty:         float = 1e6,           # €/MWh penalty for CFE shortfall (storage_hours mode)
         bisect_upper_energy: float = 1_000_000.0,  # MWh — ceiling for inner bisection
         tol_energy:          float = 1.0,           # MWh — inner bisection tolerance
         tol_ve:              float = 1.0,           # MW  — outer Nelder-Mead tolerance
@@ -221,6 +230,8 @@ class VESupply:
         self.battery             = battery
         self.demand              = demand
         self.prices              = prices
+        self.storage_hours       = storage_hours
+        self.cfe_penalty         = cfe_penalty
         self.bisect_upper_energy = bisect_upper_energy
         self.tol_energy          = tol_energy
         self.tol_ve              = tol_ve
@@ -230,18 +241,20 @@ class VESupply:
 
     def _simulate(
         self, c_solar: float, c_wind: float, batt_power: float, batt_energy: float
-    ) -> tuple[np.ndarray, np.ndarray, bool]:
+    ) -> tuple[np.ndarray, np.ndarray, float]:
         """
         Greedy dispatch. Battery charges from VE surplus above floor; discharges to
         cover shortfalls. Any VE above demand_mw after charging is exported.
         SOC initialised at 0 (worst-case for opening hours).
-        Returns (onsite profile MW, exported MW, feasible).
+        Returns (onsite MW, exported MW, cfe_shortfall_mwh).
+        cfe_shortfall_mwh = 0 means fully feasible.
         """
-        floor  = self.demand.floor_mw
-        avail  = c_solar * self.solar_cf + c_wind * self.wind_cf
-        onsite = np.empty(self.demand.HOURS)
-        sold   = np.zeros(self.demand.HOURS)
-        soc    = 0.0
+        floor         = self.demand.floor_mw
+        avail         = c_solar * self.solar_cf + c_wind * self.wind_cf
+        onsite        = np.empty(self.demand.HOURS)
+        sold          = np.zeros(self.demand.HOURS)
+        soc           = 0.0
+        shortfall_mwh = 0.0
 
         for t in range(self.demand.HOURS):
             a = avail[t]
@@ -253,13 +266,102 @@ class VESupply:
                 sold[t]    = min(max(0.0, a - charge - self.demand.demand_mw), self.demand.grid_cap_mw)
                 onsite[t]  = consume
             else:
-                shortfall  = floor - a
-                discharge  = min(shortfall, batt_power, soc)
+                deficit    = floor - a
+                discharge  = min(deficit, batt_power, soc)
                 soc       -= discharge
                 onsite[t]  = a + discharge
-                if onsite[t] < floor - 1e-6:
-                    return onsite, sold, False
-        return onsite, sold, True
+                shortfall_mwh += max(0.0, floor - onsite[t])
+        return onsite, sold, shortfall_mwh
+
+    # ── LP dispatch (perfect foresight) ──────────────────────────────────────
+
+    def _lp_solve(
+        self, c_solar: float, c_wind: float, batt_power: float, batt_energy: float
+    ) -> dict | None:
+        """
+        Solve the perfect-foresight LP for given capacities.
+
+        Variable layout (7 blocks × T):
+          0=charge  1=discharge  2=soc  3=grid_buy  4=grid_sell  5=curtail  6=cfe_excess
+
+        grid_buy is bounded at demand_mw (not grid_cap_mw) so the LP is always feasible.
+        cfe_excess[t] = max(0, grid_buy[t] - grid_cap_mw) tracks CFE violations; penalised
+        at cfe_penalty in the objective so the LP internalises the constraint.
+
+        Returns dict of arrays + 'lp_obj' (res.fun), or None if HiGHS fails unexpectedly.
+        """
+        from scipy.sparse import eye as speye, diags, hstack, vstack, csr_matrix
+        from scipy.optimize import linprog
+
+        T  = self.demand.HOURS
+        d  = self.demand.demand_mw
+        g  = self.demand.grid_cap_mw
+        p  = self.prices
+        M  = self.cfe_penalty
+        ve = c_solar * self.solar_cf + c_wind * self.wind_cf
+
+        I = speye(T, format='csr')
+        Z = csr_matrix((T, T))
+        L = diags([np.ones(T), -np.ones(T - 1)], [0, -1], shape=(T, T), format='csr')
+
+        # objective: min Σ [price*(grid_buy - grid_sell) + M*cfe_excess]
+        c_obj = np.concatenate([np.zeros(3 * T), p, -p, np.zeros(T), np.full(T, M)])
+
+        # energy balance (equality): charge - discharge - grid_buy + grid_sell + curtail = ve - d
+        A_en  = hstack([I, -I, Z, -I, I, I, Z], format='csr')
+        b_en  = ve - d
+
+        # SOC recurrence (equality): -charge + discharge + L*soc = 0
+        A_soc = hstack([-I, I, L, Z, Z, Z, Z], format='csr')
+        b_soc = np.zeros(T)
+
+        A_eq = vstack([A_en, A_soc], format='csr')
+        b_eq = np.concatenate([b_en, b_soc])
+
+        # CFE inequality: grid_buy - cfe_excess ≤ grid_cap_mw
+        A_cfe = hstack([Z, Z, Z, I, Z, Z, -I], format='csr')
+        b_cfe = np.full(T, g)
+
+        bounds = (
+              [(0.0, batt_power)]  * T   # charge (from VE or grid)
+            + [(0.0, batt_power)]  * T   # discharge (to demand or grid)
+            + [(0.0, batt_energy)] * T   # soc
+            + [(0.0, d)]           * T   # grid_buy ≤ demand_mw (always feasible)
+            + [(0.0, g)]           * T   # grid_sell ≤ grid_cap_mw
+            + [(0.0, None)]        * T   # curtail
+            + [(0.0, None)]        * T   # cfe_excess
+        )
+
+        res = linprog(c_obj, A_ub=A_cfe, b_ub=b_cfe,
+                      A_eq=A_eq, b_eq=b_eq, bounds=bounds,
+                      method='highs', options={'disp': False})
+        if res.status != 0:
+            return None
+        x = res.x
+        return {
+            'charge':     x[0 * T : 1 * T],
+            'discharge':  x[1 * T : 2 * T],
+            'soc':        x[2 * T : 3 * T],
+            'grid_buy':   x[3 * T : 4 * T],
+            'grid_sell':  x[4 * T : 5 * T],
+            'curtail':    x[5 * T : 6 * T],
+            'cfe_excess': x[6 * T : 7 * T],
+            'lp_obj':     float(res.fun),
+        }
+
+    def _lp_dispatch(
+        self, c_solar: float, c_wind: float, batt_power: float, batt_energy: float
+    ) -> tuple[np.ndarray, np.ndarray, float]:
+        """
+        Returns (onsite_mw, grid_sell_mw, cfe_shortfall_mwh).
+        cfe_shortfall_mwh = sum(cfe_excess); should be ~0 at the optimum.
+        """
+        sol = self._lp_solve(c_solar, c_wind, batt_power, batt_energy)
+        if sol is None:
+            T = self.demand.HOURS
+            return np.full(T, self.demand.demand_mw), np.zeros(T), 1e9
+        onsite = np.full(self.demand.HOURS, self.demand.demand_mw) - sol['grid_buy']
+        return onsite, sol['grid_sell'], float(sol['cfe_excess'].sum())
 
     # ── inner bisection (battery energy) ─────────────────────────────────────
 
@@ -269,11 +371,11 @@ class VESupply:
         Returns None if infeasible even at bisect_upper_energy.
         """
         lo, hi = 0.0, self.bisect_upper_energy
-        if not self._simulate(c_solar, c_wind, batt_power, hi)[2]:
+        if self._simulate(c_solar, c_wind, batt_power, hi)[2] > 0:
             return None
         while hi - lo > self.tol_energy:
             mid = (lo + hi) / 2.0
-            if self._simulate(c_solar, c_wind, batt_power, mid)[2]:
+            if self._simulate(c_solar, c_wind, batt_power, mid)[2] == 0:
                 hi = mid
             else:
                 lo = mid
@@ -296,31 +398,56 @@ class VESupply:
         c_solar    = max(0.0, float(params[0]))
         c_wind     = max(0.0, float(params[1]))
         batt_power = max(0.0, float(params[2]))
-        batt_energy = self._bisect_energy(c_solar, c_wind, batt_power)
-        if batt_energy is None:
-            return 1e15
-        cost = self._onsite_cost(c_solar, c_wind, batt_power, batt_energy)
+
+        if self.storage_hours is not None:
+            batt_energy = self.storage_hours * batt_power
+        else:
+            batt_energy = self._bisect_energy(c_solar, c_wind, batt_power)
+            if batt_energy is None:
+                return 1e15
+
         if self.prices is not None:
-            onsite, sold, _ = self._simulate(c_solar, c_wind, batt_power, batt_energy)
-            imports  = np.clip(self.demand.demand_mw - onsite, 0.0, self.demand.grid_cap_mw)
-            cost    += float((imports * self.prices).sum())
-            cost    -= float((sold * np.maximum(self.prices, 0.0)).sum())
+            # LP objective = grid_cost_net + M*cfe_excess (penalty already baked in)
+            sol = self._lp_solve(c_solar, c_wind, batt_power, batt_energy)
+            if sol is None:
+                return 1e15
+            return self._onsite_cost(c_solar, c_wind, batt_power, batt_energy) + sol['lp_obj']
+
+        onsite, sold, shortfall_mwh = self._simulate(c_solar, c_wind, batt_power, batt_energy)
+        cost  = self._onsite_cost(c_solar, c_wind, batt_power, batt_energy)
+        cost += shortfall_mwh * self.cfe_penalty
         return cost
+
+    def _x0_batt(self) -> float:
+        """Starting battery power for Nelder-Mead: enough to cover the worst shortfall run at x0 VE."""
+        if self.storage_hours is None:
+            return 500.0
+        avail    = 1_000.0 * self.solar_cf + 3_000.0 * self.wind_cf
+        deficit  = np.maximum(self.demand.floor_mw - avail, 0.0)
+        # sliding window: find the maximum energy deficit over any storage_hours-length window
+        win      = max(1, int(self.storage_hours))
+        cum      = np.cumsum(np.concatenate([[0.0], deficit]))
+        max_need = float(np.max(cum[win:] - cum[:-win]))
+        # P_batt must deliver max_need MWh in storage_hours hours
+        return max(500.0, max_need / self.storage_hours)
 
     def _optimise(self) -> tuple[float, float, float, float]:
         from scipy.optimize import minimize
         res = minimize(
             self._objective,
-            x0      = np.array([1_000.0, 3_000.0, 500.0]),
+            x0      = np.array([1_000.0, 3_000.0, self._x0_batt()]),
             method  = 'Nelder-Mead',
             options = {'xatol': self.tol_ve, 'fatol': 1e6, 'maxiter': 10_000, 'adaptive': True},
         )
         c_solar    = max(0.0, float(res.x[0]))
         c_wind     = max(0.0, float(res.x[1]))
         batt_power = max(0.0, float(res.x[2]))
-        batt_energy = self._bisect_energy(c_solar, c_wind, batt_power)
-        if batt_energy is None:
-            raise RuntimeError("Optimised VE solution is infeasible — raise bisect_upper_energy.")
+        if self.storage_hours is not None:
+            batt_energy = self.storage_hours * batt_power
+        else:
+            batt_energy = self._bisect_energy(c_solar, c_wind, batt_power)
+            if batt_energy is None:
+                raise RuntimeError("Optimised VE solution is infeasible — raise bisect_upper_energy.")
         return c_solar, c_wind, batt_power, batt_energy
 
     # ── persistence ──────────────────────────────────────────────────────────
@@ -369,7 +496,16 @@ class VESupply:
 
     def dispatch(self) -> np.ndarray:
         c_solar, c_wind, batt_power, batt_energy = self.solution
+        if self.prices is not None:
+            return self._lp_dispatch(c_solar, c_wind, batt_power, batt_energy)[0]
         return self._simulate(c_solar, c_wind, batt_power, batt_energy)[0]
+
+    def lp_detail(self) -> dict | None:
+        """All LP dispatch arrays for the optimised solution. None if no prices."""
+        if self.prices is None:
+            return None
+        c_solar, c_wind, batt_power, batt_energy = self.solution
+        return self._lp_solve(c_solar, c_wind, batt_power, batt_energy)
 
     def annual_onsite_cost(self) -> float:
         c_solar, c_wind, batt_power, batt_energy = self.solution
@@ -377,11 +513,23 @@ class VESupply:
 
     def result(self, grid: GridSupply) -> Result:
         c_solar, c_wind, batt_power, batt_energy = self.solution
-        onsite, sold, _ = self._simulate(c_solar, c_wind, batt_power, batt_energy)
-        onsite_cost     = self.annual_onsite_cost()
-        grid_cost       = grid.cost(onsite)
-        export_revenue  = float((sold * np.maximum(grid.prices, 0.0)).sum())
-        total           = onsite_cost + grid_cost - export_revenue
+        onsite_cost = self.annual_onsite_cost()
+
+        if self.prices is not None:
+            sol            = self._lp_solve(c_solar, c_wind, batt_power, batt_energy)
+            grid_buy       = sol['grid_buy']
+            grid_sell      = sol['grid_sell']
+            grid_cost      = float((grid_buy * grid.prices).sum())
+            export_revenue = float((grid_sell * np.maximum(grid.prices, 0.0)).sum())
+            shortfall_mwh  = float(sol['cfe_excess'].sum())
+            grid_import_mwh = float(grid_buy.sum())
+        else:
+            onsite, sold, shortfall_mwh = self._simulate(c_solar, c_wind, batt_power, batt_energy)
+            grid_cost       = grid.cost(onsite)
+            export_revenue  = float((sold * np.maximum(grid.prices, 0.0)).sum())
+            grid_import_mwh = float(grid.imports(onsite).sum())
+
+        total = onsite_cost + grid_cost - export_revenue
         return Result(
             label                  = "VE",
             c_solar_mw             = c_solar,
@@ -394,7 +542,8 @@ class VESupply:
             annual_export_revenue  = export_revenue,
             annual_total_cost      = total,
             lcoe                   = total / self.demand.annual_mwh,
-            grid_import_mwh        = float(grid.imports(onsite).sum()),
+            grid_import_mwh        = grid_import_mwh,
+            cfe_shortfall_mwh      = shortfall_mwh,
         )
 
 
