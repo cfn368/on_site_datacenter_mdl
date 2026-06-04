@@ -191,18 +191,16 @@ class KKSupply:
 
 class VESupply:
     """
-    Solar + wind + battery. Jointly optimises (C_solar, C_wind, P_batt).
+    Solar + wind + battery. Jointly optimises (C_solar, C_wind, P_batt [, E_batt]).
 
     When prices are provided:
-      Outer: Nelder-Mead over (C_solar, C_wind, P_batt).
-      Inner: perfect-foresight LP over all 8760 hours (scipy HiGHS). Battery is
-             fully bidirectional — can charge from grid and discharge to grid.
-             CFE floor enforced as grid_buy[t] ≤ grid_cap_mw per hour.
+      Single LP over all capacity and dispatch variables simultaneously (scipy HiGHS).
+      Battery is fully bidirectional. CFE floor enforced as grid_buy[t] ≤ grid_cap_mw.
+      storage_hours=None makes E_batt a free LP variable; set → E_batt = sh × P_batt.
 
     Without prices (no-price mode):
-      Greedy dispatch. Inner bisection on E_batt for feasibility.
-
-    storage_hours fixes E_batt = storage_hours × P_batt (removes inner bisection).
+      Greedy dispatch. Nelder-Mead outer over (C_solar, C_wind, P_batt); inner
+      bisection on E_batt for feasibility.
     """
     def __init__(
         self,
@@ -350,6 +348,132 @@ class VESupply:
             'lp_obj':     float(res.fun),
         }
 
+    def _single_lp(self) -> dict | None:
+        """
+        Single LP over capacity variables + full dispatch. Replaces Nelder-Mead + inner LP.
+
+        Variable layout: [c_solar, c_wind, batt_power (, batt_energy),
+                          charge(T), discharge(T), soc(T),
+                          grid_buy(T), grid_sell(T), curtail(T), cfe_excess(T)]
+
+        storage_hours=None adds batt_energy as a 4th free capacity variable.
+        Returns dict with capacity scalars, all 7 dispatch arrays, pv_gen, wl_gen, lp_obj.
+        """
+        from scipy.sparse import eye as speye, diags, hstack, vstack, csr_matrix
+        from scipy.optimize import linprog
+
+        T      = self.demand.HOURS
+        d      = self.demand.demand_mw
+        g      = self.demand.grid_cap_mw
+        p      = self.prices
+        M      = self.cfe_penalty
+        sh     = self.storage_hours
+        free_e = (sh is None)
+        N_cap  = 4 if free_e else 3
+
+        # ── capacity cost coefficients ────────────────────────────────────────
+
+        c_solar_coef = (self.solar_tech.capex * self.solar_tech.crf
+                        + self.solar_tech.opex_fixed
+                        + self.solar_tech.opex_var * float(self.solar_cf.sum()))
+        c_wind_coef  = (self.wind_tech.capex * self.wind_tech.crf
+                        + self.wind_tech.opex_fixed
+                        + self.wind_tech.opex_var * float(self.wind_cf.sum()))
+        if free_e:
+            cap_costs = [c_solar_coef, c_wind_coef,
+                         self.battery.capex_power * self.battery.crf + self.battery.opex_fixed,
+                         self.battery.capex_energy * self.battery.crf]
+        else:
+            cap_costs = [c_solar_coef, c_wind_coef,
+                         (self.battery.capex_power + self.battery.capex_energy * sh)
+                         * self.battery.crf + self.battery.opex_fixed]
+
+        c_obj = np.concatenate([cap_costs, np.zeros(3 * T), p, -p,
+                                 np.zeros(T), np.full(T, M)])
+
+        # ── sparse blocks ─────────────────────────────────────────────────────
+
+        I  = speye(T, format='csr')
+        Z  = csr_matrix((T, T))
+        L  = diags([np.ones(T), -np.ones(T - 1)], [0, -1], shape=(T, T), format='csr')
+        Zc = csr_matrix((T, N_cap))
+
+        # ── energy balance (equality, T rows) ─────────────────────────────────
+        # −c_solar·solar_cf − c_wind·wind_cf [−0·batt_power [−0·batt_energy]]
+        # + charge − discharge − grid_buy + grid_sell + curtail = −demand_mw
+
+        cf_cols = [-self.solar_cf, -self.wind_cf] + [np.zeros(T)] * (N_cap - 2)
+        A_en = hstack([csr_matrix(np.column_stack(cf_cols)),
+                       I, -I, Z, -I, I, I, Z], format='csr')
+
+        # ── SOC recurrence (equality, T rows) ─────────────────────────────────
+
+        A_soc_eq = hstack([Zc, -I, I, L, Z, Z, Z, Z], format='csr')
+
+        A_eq = vstack([A_en, A_soc_eq], format='csr')
+        b_eq = np.concatenate([np.full(T, -d), np.zeros(T)])
+
+        # ── CFE inequality (T rows): grid_buy − cfe_excess ≤ grid_cap_mw ─────
+
+        A_cfe = hstack([Zc, Z, Z, Z, I, Z, Z, -I], format='csr')
+
+        # ── capacity bound inequalities (3T rows) ─────────────────────────────
+        # charge[t]    ≤ batt_power                  → col 2 coeff = −1
+        # discharge[t] ≤ batt_power                  → col 2 coeff = −1
+        # soc[t]       ≤ sh·batt_power  (or E_batt)  → col 2 coeff = −sh (or col 3 = −1)
+
+        pw = np.zeros((T, N_cap)); pw[:, 2] = -1.0
+        en = np.zeros((T, N_cap))
+        en[:, 3 if free_e else 2] = -1.0 if free_e else -sh
+
+        A_ub = vstack([
+            A_cfe,
+            hstack([csr_matrix(pw), I, Z, Z, Z, Z, Z, Z], format='csr'),
+            hstack([csr_matrix(pw), Z, I, Z, Z, Z, Z, Z], format='csr'),
+            hstack([csr_matrix(en), Z, Z, I, Z, Z, Z, Z], format='csr'),
+        ], format='csr')
+        b_ub = np.concatenate([np.full(T, g), np.zeros(3 * T)])
+
+        # ── bounds ────────────────────────────────────────────────────────────
+
+        bounds = (
+            [(0.0, None)] * N_cap        # capacity variables ≥ 0
+            + [(0.0, None)] * (3 * T)    # charge, discharge, soc (upper via inequality)
+            + [(0.0, d)]    * T          # grid_buy ≤ demand_mw
+            + [(0.0, g)]    * T          # grid_sell ≤ grid_cap_mw
+            + [(0.0, None)] * (2 * T)    # curtail, cfe_excess
+        )
+
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub,
+                      A_eq=A_eq, b_eq=b_eq, bounds=bounds,
+                      method='highs', options={'disp': False})
+        if res.status != 0:
+            return None
+
+        x   = res.x
+        c_s = float(x[0])
+        c_w = float(x[1])
+        b_p = float(x[2])
+        b_e = float(x[3]) if free_e else sh * b_p
+        off = N_cap
+
+        return {
+            'c_solar':     c_s,
+            'c_wind':      c_w,
+            'batt_power':  b_p,
+            'batt_energy': b_e,
+            'charge':      x[off + 0*T : off + 1*T],
+            'discharge':   x[off + 1*T : off + 2*T],
+            'soc':         x[off + 2*T : off + 3*T],
+            'grid_buy':    x[off + 3*T : off + 4*T],
+            'grid_sell':   x[off + 4*T : off + 5*T],
+            'curtail':     x[off + 5*T : off + 6*T],
+            'cfe_excess':  x[off + 6*T : off + 7*T],
+            'lp_obj':      float(res.fun),
+            'pv_gen':      c_s * self.solar_cf,
+            'wl_gen':      c_w * self.wind_cf,
+        }
+
     def _lp_dispatch(
         self, c_solar: float, c_wind: float, batt_power: float, batt_energy: float
     ) -> tuple[np.ndarray, np.ndarray, float]:
@@ -471,20 +595,25 @@ class VESupply:
         self._solution = (d['c_solar'], d['c_wind'], d['batt_power'], d['batt_energy'])
 
     def save_lp_arrays(self, path: str | pathlib.Path = 'runs/ve_lp_arrays.npz') -> None:
-        """Save LP dispatch arrays to npz. Runs the LP if not already cached."""
+        """Save LP arrays (capacities + dispatch) to npz."""
         lp = self.lp_detail()
         if lp is None:
             raise RuntimeError("No prices set — LP arrays not available.")
         p = pathlib.Path(path)
         p.parent.mkdir(exist_ok=True)
-        save_keys = ['charge', 'discharge', 'soc', 'grid_buy', 'grid_sell',
+        save_keys = ['c_solar', 'c_wind', 'batt_power', 'batt_energy',
+                     'charge', 'discharge', 'soc', 'grid_buy', 'grid_sell',
                      'curtail', 'cfe_excess', 'pv_gen', 'wl_gen']
-        np.savez(str(p), **{k: lp[k] for k in save_keys})
+        np.savez(str(p), **{k: lp[k] for k in save_keys if k in lp})
 
     def load_lp_arrays(self, path: str | pathlib.Path = 'runs/ve_lp_arrays.npz') -> None:
-        """Load LP dispatch arrays from npz, bypassing the LP re-solve."""
-        data = np.load(str(pathlib.Path(path)))
-        self._lp_cache = {k: data[k] for k in data.files}
+        """Load LP arrays from npz, bypassing the LP solve."""
+        data  = np.load(str(pathlib.Path(path)))
+        cache = {k: data[k] for k in data.files}
+        for k in ('c_solar', 'c_wind', 'batt_power', 'batt_energy'):
+            if k in cache:
+                cache[k] = float(cache[k])
+        self._lp_cache = cache
 
     def save_lp_txt(self, directory: str | pathlib.Path = 'runs/lp_arrays') -> None:
         """Save LP dispatch arrays as individual txt files (one value per line)."""
@@ -504,7 +633,14 @@ class VESupply:
     def solution(self) -> tuple[float, float, float, float]:
         """(c_solar, c_wind, batt_power, batt_energy) — optimised and cached."""
         if self._solution is None:
-            self._solution = self._optimise()
+            if self.prices is not None:
+                lp = self.lp_detail()   # single LP path
+                if lp is None:
+                    raise RuntimeError("Single LP failed — check inputs.")
+                self._solution = (lp['c_solar'], lp['c_wind'],
+                                  lp['batt_power'], lp['batt_energy'])
+            else:
+                self._solution = self._optimise()   # greedy NM path
         return self._solution
 
     @property
@@ -524,24 +660,20 @@ class VESupply:
         return self.solution[3]
 
     def dispatch(self) -> np.ndarray:
-        c_solar, c_wind, batt_power, batt_energy = self.solution
         if self.prices is not None:
-            return self._lp_dispatch(c_solar, c_wind, batt_power, batt_energy)[0]
+            lp = self.lp_detail()
+            return np.full(self.demand.HOURS, self.demand.demand_mw) - lp['grid_buy']
+        c_solar, c_wind, batt_power, batt_energy = self.solution
         return self._simulate(c_solar, c_wind, batt_power, batt_energy)[0]
 
     def lp_detail(self) -> dict | None:
-        """All LP dispatch arrays for the optimised solution. None if no prices."""
+        """All LP arrays for the optimised solution (single LP). None if no prices."""
         if self._lp_cache is not None:
             return self._lp_cache
         if self.prices is None:
             return None
-        c_solar, c_wind, batt_power, batt_energy = self.solution
-        result = self._lp_solve(c_solar, c_wind, batt_power, batt_energy)
-        if result is not None:
-            result['pv_gen'] = c_solar * self.solar_cf
-            result['wl_gen'] = c_wind * self.wind_cf
-        self._lp_cache = result
-        return result
+        self._lp_cache = self._single_lp()
+        return self._lp_cache
 
     def annual_onsite_cost(self) -> float:
         c_solar, c_wind, batt_power, batt_energy = self.solution
@@ -552,12 +684,12 @@ class VESupply:
         onsite_cost = self.annual_onsite_cost()
 
         if self.prices is not None:
-            sol            = self._lp_solve(c_solar, c_wind, batt_power, batt_energy)
-            grid_buy       = sol['grid_buy']
-            grid_sell      = sol['grid_sell']
-            grid_cost      = float((grid_buy * grid.prices).sum())
-            export_revenue = float((grid_sell * np.maximum(grid.prices, 0.0)).sum())
-            shortfall_mwh  = float(sol['cfe_excess'].sum())
+            sol             = self.lp_detail()
+            grid_buy        = sol['grid_buy']
+            grid_sell       = sol['grid_sell']
+            grid_cost       = float((grid_buy * grid.prices).sum())
+            export_revenue  = float((grid_sell * np.maximum(grid.prices, 0.0)).sum())
+            shortfall_mwh   = float(sol['cfe_excess'].sum())
             grid_import_mwh = float(grid_buy.sum())
         else:
             onsite, sold, shortfall_mwh = self._simulate(c_solar, c_wind, batt_power, batt_energy)
