@@ -2,18 +2,18 @@
 
 Developed by Linus Lindquist for [Erhvervslivets Tænketank](https://www.etank.dk) as part of Kernekraftprojektet.
 
-A 1 GW datacenter must source a legally mandated fraction of its load from on-site generation. The model compares two technologies on annualised cost: a small modular nuclear reactor (KK) that delivers constant output, and a solar-wind-battery portfolio (VE) that dispatches optimally against hourly spot prices. The comparison is run across the full range of on-site fractions and storage durations.
+A 1 GW datacenter must source a legally mandated fraction of its load from on-site generation. The model compares two technologies on annualised cost: a small modular nuclear reactor (KK) that delivers constant output interrupted by a planned annual maintenance window, and a solar-wind-battery portfolio (VE) that dispatches optimally against hourly spot prices. The comparison is run across multiple years and on-site fractions.
 
 ## Data sources
 
-| Source | Content | File |
-|--------|---------|------|
-| [Energi Data Service](https://www.energidataservice.dk) | Hourly DK weighted-average spot price (DKK/MWh) | `variation_patterns/wp_2025_2026.txt` |
-| Energi Data Service | Hourly Danish solar fleet production (MWh/h) | `variation_patterns/PV_VE_2025_2026.txt` |
-| Energi Data Service | Hourly Danish onshore wind fleet production (MWh/h) | `variation_patterns/WL_VE_2025_2026.txt` |
+| Source | Content | Files |
+|--------|---------|-------|
+| [Energi Data Service](https://www.energidataservice.dk) | Hourly DK weighted-average spot price (DKK/MWh) | `variation_patterns/wp_{Y}_{Y+1}.txt` |
+| Energi Data Service | Hourly Danish solar fleet production (MWh/h) | `variation_patterns/PV_VE_{Y}_{Y+1}.txt` |
+| Energi Data Service | Hourly Danish onshore wind fleet production (MWh/h) | `variation_patterns/WL_VE_{Y}_{Y+1}.txt` |
 | DEA Technology Data 2030 | Capital and O&M cost assumptions for solar, wind, battery, and SMR | `assumptions.py` |
 
-Raw production series are divided by fleet capacity (PV: 4 955.5 MW, wind: 4 878.5 MW) to obtain hourly capacity factors. Spot prices are converted from DKK to EUR at 7.46.
+Raw production series are divided by fleet capacity to obtain hourly capacity factors. Spot prices are converted from DKK to EUR at 7.46. Data is available for 2022–2025.
 
 ## Repository structure
 
@@ -23,15 +23,16 @@ KK_datacentre/
 ├── assumptions.py        # All cost and technical parameters — import from here, never hardcode
 │
 ├── pylib/
-│   ├── setup.py          # Notebook preamble: autoreload, AEJ style, standard imports
-│   └── ve_dispatch.py    # Dispatch detail, aggregation, and plotting for 3_VE.ipynb
+│   ├── setup.py          # Notebook preamble: autoreload, AEJ style, standard imports + mdates
+│   └── ve_dispatch.py    # Dispatch detail, aggregation, and plotting (DISPATCH_COLORS, plot_dispatch, plot_battery)
 │
 ├── 1_input.ipynb         # Fetches and saves variation pattern files via ET-eds-api
 ├── 2_model.ipynb         # Builds and runs the model, prints results, saves VE solution
-├── 3_VE.ipynb            # VE dispatch visualisation: stacked area and battery figures
+├── 3_time_series.ipynb   # Time series figures: VE dispatch/battery and KK hourly profile
+├── 4_cases.ipynb         # Multi-year, multi-x results table
 │
 ├── variation_patterns/   # 8760-row input files (one value per line, dot-decimal)
-├── runs/                 # ve_solution.json — cached VE optimisation result
+├── runs/                 # ve_solution.json and ve_lp_arrays.npz — cached VE solution
 └── figures/              # Output figures
 ```
 
@@ -39,15 +40,19 @@ KK_datacentre/
 
 ### KK
 
-The KK operator's problem is simple, because nuclear output is constant. The reactor either runs at the minimum legal output or at full demand — there is no intermediate optimum. Building more capacity adds cost linearly, and importing from the grid is cheaper only if the spot price falls below the reactor's variable cost. The decision rule reduces to a single break-even comparison: if the mean spot price exceeds the reactor's marginal cost (~67 €/MWh at current assumptions), the operator builds to full demand and imports nothing. At the mean Danish spot price of ~82 €/MWh, KK serves the full 1 GW with zero grid imports.
+The KK operator installs 1,000 MW and runs at full output for 90% of the year. The remaining 10% (876 hours) is a contiguous planned maintenance window, placed tactically at the cheapest consecutive hours in the price series to minimise grid purchase cost during downtime. During the outage the datacenter imports the full 1,000 MW from the grid; the hourly on-site fraction requirement is waived for planned maintenance.
+
+Total KK cost has three components: (1) annualised reactor capex and O&M (~31 €/MWh variable, 60-year lifetime); (2) spot cost of grid imports during the 876-hour outage plus an 8.7 øre/kWh consumption tariff; (3) annualised grid connection fee (tilslutningsbidrag, treated as a perpetuity).
 
 ### VE
 
-The VE operator faces a harder problem. Solar and wind are intermittent, the battery has limited storage, and the on-site floor must be met every hour regardless. The operator chooses how much solar, wind, and battery power to install, then dispatches them optimally given perfect foresight of prices and weather.
+The VE operator faces a harder problem. Solar and wind are intermittent, the battery has limited storage, and the on-site floor must be met every hour. The operator chooses how much solar, wind, and battery power to install, then dispatches them optimally against hourly spot prices.
 
-Dispatch is solved as a linear programme over all 8760 hours simultaneously (HiGHS via `scipy.optimize.linprog`). The battery is fully bidirectional: it charges from VE surplus or cheap grid electricity and discharges to the datacenter or the grid. The on-site fraction requirement is enforced by penalising excess grid imports at 1 M€/MWh, making the constraint effectively hard. The outer optimisation (Nelder-Mead over three capacity variables) then minimises total annualised cost — capital, O&M, net grid cost — trading off higher build-out against better CFE compliance and arbitrage revenue.
+The entire problem — capacities and all 8,760-hour dispatch decisions — is solved as a single linear programme (HiGHS via `scipy.optimize.linprog`). The battery is fully bidirectional: it charges from VE surplus or cheap grid electricity and discharges to the datacenter or the grid. The on-site fraction requirement is enforced hourly. Grid purchases carry an 8.7 øre/kWh consumption tariff; grid sales carry a 1.15 øre/kWh production tariff; both enter the LP objective so the optimiser internalises them.
 
-At current assumptions (`x = 0.5`, 12-hour battery, DEA 2030 costs) the VE optimum involves a large solar overbuild (~6× demand) that charges the battery cheaply and generates substantial export revenue. VE LCOE is approximately 86 €/MWh versus KK at 75 €/MWh.
+Additional fixed costs: solar land rent (4,800 €/MW/yr), grid connection fee (tilslutningsbidrag, scales with `(1−x)·P`, perpetuity).
+
+At low `x` the VE optimum involves a large solar overbuild that generates substantial export revenue, making VE cheaper than KK. At high `x` the on-site floor tightens, the export cap shrinks, and KK's stable output becomes the cheaper option.
 
 ## How to run
 
@@ -61,7 +66,8 @@ setup_notebook()
 Run in order:
 
 1. `1_input.ipynb` — fetches variation patterns from Energi Data Service and writes them to `variation_patterns/`. Requires internet access and the `ET-eds-api` package.
-2. `2_model.ipynb` — loads inputs, runs both optimisations, prints the KK vs VE comparison, and saves the VE solution to `runs/ve_solution.json`. The VE optimisation takes 5–10 minutes.
-3. `3_VE.ipynb` — loads the cached solution and produces dispatch figures. Runs in seconds.
+2. `2_model.ipynb` — loads inputs, runs the single LP, prints the KK vs VE comparison, and saves the VE solution to `runs/`. Solves in seconds.
+3. `3_time_series.ipynb` — loads the cached solution and produces dispatch and battery figures for VE, plus the KK hourly profile showing the planned outage window.
+4. `4_cases.ipynb` — runs both models across years (2022–2025) and on-site fractions (25/50/75 %) and prints the results table.
 
-To change the on-site fraction or battery duration, edit `x` and `storage_hours` in `2_model.ipynb`. All cost assumptions are in `assumptions.py`.
+To change the on-site fraction or battery duration, edit `x` and `storage_hours` in `2_model.ipynb` and `4_cases.ipynb`. All cost assumptions are in `assumptions.py`.
