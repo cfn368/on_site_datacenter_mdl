@@ -1,6 +1,7 @@
 eds_cache
 .claude
 __pycache__
-notesgit .txt
+*.txt.notes
+notes*.txt
+*.docx
 data
-.docx

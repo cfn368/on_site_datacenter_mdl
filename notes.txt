@@ -1,4 +1,0 @@
-
-0.  first sanity on plots
-1.  understand the current state of the mode throughly
-2.  stress test with different x and years
