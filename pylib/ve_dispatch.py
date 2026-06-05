@@ -14,7 +14,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 __all__ = [
-    'MAANED_DK', 'DISPATCH_COLORS',
+    'MAANED_DK', 'MAANED_EN', 'DISPATCH_COLORS',
     'dispatch_detail', 'aggregate_dispatch', 'plot_dispatch',
     'battery_detail', 'plot_battery',
 ]
@@ -25,6 +25,8 @@ __all__ = [
 
 MAANED_DK = ['Jan', 'Feb', 'Mar', 'Apr', 'Maj', 'Jun',
              'Jul', 'Aug', 'Sep', 'Okt', 'Nov', 'Dec']
+MAANED_EN = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+             'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
 DISPATCH_COLORS = {
     'grid':     '#C9C0B8',   # warm light grey  — grid import
@@ -194,7 +196,7 @@ def _month_ticks(idx):
         gaps = np.where(np.diff(pos) > 1)[0]
         if len(gaps):
             pos = pos[:gaps[0] + 1]
-        ticks.append((pos[0] + pos[-1]) // 2)
+        ticks.append(pos[0])
         labels.append(MAANED_DK[m - 1])
     return ticks, labels
 

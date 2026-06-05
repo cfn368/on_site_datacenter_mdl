@@ -338,31 +338,34 @@ class VESupply:
         L = diags([np.ones(T), -np.ones(T - 1)], [0, -1], shape=(T, T), format='csr')
 
         # objective: min Σ [(price+buy_tariff)*grid_buy - (price-sell_tariff)*grid_sell + M*cfe_excess]
-        c_obj = np.concatenate([np.zeros(3 * T), p + self.buy_tariff, -p + self.sell_tariff, np.zeros(T), np.full(T, M)])
+        # curtail_wl has cost -opex_var: LP saves wind O&M by curtailing wind before solar
+        c_obj = np.concatenate([np.zeros(3 * T), p + self.buy_tariff, -p + self.sell_tariff,
+                                 np.zeros(T), np.full(T, -self.wind_tech.opex_var), np.full(T, M)])
 
-        # energy balance (equality): charge - discharge - grid_buy + grid_sell + curtail = ve - d
-        A_en  = hstack([I, -I, Z, -I, I, I, Z], format='csr')
+        # energy balance (equality): charge - discharge - grid_buy + grid_sell + curtail_pv + curtail_wl = ve - d
+        A_en  = hstack([I, -I, Z, -I, I, I, I, Z], format='csr')
         b_en  = ve - d
 
         # SOC recurrence (equality): -charge + discharge + L*soc = 0
-        A_soc = hstack([-I, I, L, Z, Z, Z, Z], format='csr')
+        A_soc = hstack([-I, I, L, Z, Z, Z, Z, Z], format='csr')
         b_soc = np.zeros(T)
 
         A_eq = vstack([A_en, A_soc], format='csr')
         b_eq = np.concatenate([b_en, b_soc])
 
         # CFE inequality: grid_buy - cfe_excess ≤ grid_cap_mw
-        A_cfe = hstack([Z, Z, Z, I, Z, Z, -I], format='csr')
+        A_cfe = hstack([Z, Z, Z, I, Z, Z, Z, -I], format='csr')
         b_cfe = np.full(T, g)
 
         bounds = (
-              [(0.0, batt_power)]  * T   # charge (from VE or grid)
-            + [(0.0, batt_power)]  * T   # discharge (to demand or grid)
-            + [(0.0, batt_energy)] * T   # soc
-            + [(0.0, d)]           * T   # grid_buy ≤ demand_mw (always feasible)
-            + [(0.0, g)]           * T   # grid_sell ≤ grid_cap_mw
-            + [(0.0, None)]        * T   # curtail
-            + [(0.0, None)]        * T   # cfe_excess
+              [(0.0, batt_power)]  * T                                     # charge
+            + [(0.0, batt_power)]  * T                                     # discharge
+            + [(0.0, batt_energy)] * T                                     # soc
+            + [(0.0, d)]           * T                                     # grid_buy
+            + [(0.0, g)]           * T                                     # grid_sell
+            + list(zip([0.0]*T, c_solar * self.solar_cf))                  # curtail_pv ≤ pv_gen
+            + list(zip([0.0]*T, c_wind  * self.wind_cf))                   # curtail_wl ≤ wl_gen
+            + [(0.0, None)]        * T                                     # cfe_excess
         )
 
         res = linprog(c_obj, A_ub=A_cfe, b_ub=b_cfe,
@@ -377,8 +380,10 @@ class VESupply:
             'soc':        x[2 * T : 3 * T],
             'grid_buy':   x[3 * T : 4 * T],
             'grid_sell':  x[4 * T : 5 * T],
-            'curtail':    x[5 * T : 6 * T],
-            'cfe_excess': x[6 * T : 7 * T],
+            'curtail_pv': x[5 * T : 6 * T],
+            'curtail_wl': x[6 * T : 7 * T],
+            'curtail':    x[5 * T : 6 * T] + x[6 * T : 7 * T],
+            'cfe_excess': x[7 * T : 8 * T],
             'lp_obj':     float(res.fun),
         }
 
@@ -423,7 +428,7 @@ class VESupply:
                          * self.battery.crf + self.battery.opex_fixed]
 
         c_obj = np.concatenate([cap_costs, np.zeros(3 * T), p + self.buy_tariff, -p + self.sell_tariff,
-                                 np.zeros(T), np.full(T, M)])
+                                 np.zeros(T), np.full(T, -self.wind_tech.opex_var), np.full(T, M)])
 
         # ── sparse blocks ─────────────────────────────────────────────────────
 
@@ -438,18 +443,18 @@ class VESupply:
 
         cf_cols = [-self.solar_cf, -self.wind_cf] + [np.zeros(T)] * (N_cap - 2)
         A_en = hstack([csr_matrix(np.column_stack(cf_cols)),
-                       I, -I, Z, -I, I, I, Z], format='csr')
+                       I, -I, Z, -I, I, I, I, Z], format='csr')
 
         # ── SOC recurrence (equality, T rows) ─────────────────────────────────
 
-        A_soc_eq = hstack([Zc, -I, I, L, Z, Z, Z, Z], format='csr')
+        A_soc_eq = hstack([Zc, -I, I, L, Z, Z, Z, Z, Z], format='csr')
 
         A_eq = vstack([A_en, A_soc_eq], format='csr')
         b_eq = np.concatenate([np.full(T, -d), np.zeros(T)])
 
         # ── CFE inequality (T rows): grid_buy − cfe_excess ≤ grid_cap_mw ─────
 
-        A_cfe = hstack([Zc, Z, Z, Z, I, Z, Z, -I], format='csr')
+        A_cfe = hstack([Zc, Z, Z, Z, I, Z, Z, Z, -I], format='csr')
 
         # ── capacity bound inequalities (3T rows) ─────────────────────────────
         # charge[t]    ≤ batt_power                  → col 2 coeff = −1
@@ -460,13 +465,18 @@ class VESupply:
         en = np.zeros((T, N_cap))
         en[:, 3 if free_e else 2] = -1.0 if free_e else -sh
 
+        pv_cap = np.zeros((T, N_cap)); pv_cap[:, 0] = -self.solar_cf
+        wl_cap = np.zeros((T, N_cap)); wl_cap[:, 1] = -self.wind_cf
+
         A_ub = vstack([
             A_cfe,
-            hstack([csr_matrix(pw), I, Z, Z, Z, Z, Z, Z], format='csr'),
-            hstack([csr_matrix(pw), Z, I, Z, Z, Z, Z, Z], format='csr'),
-            hstack([csr_matrix(en), Z, Z, I, Z, Z, Z, Z], format='csr'),
+            hstack([csr_matrix(pw),     I, Z, Z, Z, Z, Z, Z, Z], format='csr'),
+            hstack([csr_matrix(pw),     Z, I, Z, Z, Z, Z, Z, Z], format='csr'),
+            hstack([csr_matrix(en),     Z, Z, I, Z, Z, Z, Z, Z], format='csr'),
+            hstack([csr_matrix(pv_cap), Z, Z, Z, Z, Z, I, Z, Z], format='csr'),
+            hstack([csr_matrix(wl_cap), Z, Z, Z, Z, Z, Z, I, Z], format='csr'),
         ], format='csr')
-        b_ub = np.concatenate([np.full(T, g), np.zeros(3 * T)])
+        b_ub = np.concatenate([np.full(T, g), np.zeros(5 * T)])
 
         # ── bounds ────────────────────────────────────────────────────────────
 
@@ -475,7 +485,7 @@ class VESupply:
             + [(0.0, None)] * (3 * T)    # charge, discharge, soc (upper via inequality)
             + [(0.0, d)]    * T          # grid_buy ≤ demand_mw
             + [(0.0, g)]    * T          # grid_sell ≤ grid_cap_mw
-            + [(0.0, None)] * (2 * T)    # curtail, cfe_excess
+            + [(0.0, None)] * (3 * T)    # curtail_pv, curtail_wl, cfe_excess
         )
 
         res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub,
@@ -501,8 +511,10 @@ class VESupply:
             'soc':         x[off + 2*T : off + 3*T],
             'grid_buy':    x[off + 3*T : off + 4*T],
             'grid_sell':   x[off + 4*T : off + 5*T],
-            'curtail':     x[off + 5*T : off + 6*T],
-            'cfe_excess':  x[off + 6*T : off + 7*T],
+            'curtail_pv':  x[off + 5*T : off + 6*T],
+            'curtail_wl':  x[off + 6*T : off + 7*T],
+            'curtail':     x[off + 5*T : off + 6*T] + x[off + 6*T : off + 7*T],
+            'cfe_excess':  x[off + 7*T : off + 8*T],
             'lp_obj':      float(res.fun),
             'pv_gen':      c_s * self.solar_cf,
             'wl_gen':      c_w * self.wind_cf,
@@ -637,7 +649,7 @@ class VESupply:
         p.parent.mkdir(exist_ok=True)
         save_keys = ['c_solar', 'c_wind', 'batt_power', 'batt_energy',
                      'charge', 'discharge', 'soc', 'grid_buy', 'grid_sell',
-                     'curtail', 'cfe_excess', 'pv_gen', 'wl_gen']
+                     'curtail', 'curtail_pv', 'curtail_wl', 'cfe_excess', 'pv_gen', 'wl_gen']
         np.savez(str(p), **{k: lp[k] for k in save_keys if k in lp})
 
     def load_lp_arrays(self, path: str | pathlib.Path = 'runs/ve_lp_arrays.npz') -> None:
@@ -657,7 +669,7 @@ class VESupply:
         d = pathlib.Path(directory)
         d.mkdir(parents=True, exist_ok=True)
         save_keys = ['charge', 'discharge', 'soc', 'grid_buy', 'grid_sell',
-                     'curtail', 'cfe_excess', 'pv_gen', 'wl_gen']
+                     'curtail', 'curtail_pv', 'curtail_wl', 'cfe_excess', 'pv_gen', 'wl_gen']
         for k in save_keys:
             np.savetxt(str(d / f'{k}.txt'), lp[k], fmt='%.4f')
 
