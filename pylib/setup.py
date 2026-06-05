@@ -93,6 +93,7 @@ def setup_notebook(*, autoreload: int = 2, aej: bool = True, **aej_kwargs) -> No
         'mpl': mpl, 'mticker': mticker, 'mdates': mdates,
         'pathlib': pathlib, 'time': time, 'sys': sys,
         'TEXT_COLOR': TEXT_COLOR,
+        'fig_title': fig_title,
     })
 
     if aej:

@@ -11,13 +11,17 @@ import pathlib
 
 import numpy as np
 import pandas as pd
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 
 __all__ = [
     'MAANED_DK', 'MAANED_EN', 'DISPATCH_COLORS',
     'dispatch_detail', 'aggregate_dispatch', 'plot_dispatch',
     'battery_detail', 'plot_battery',
+    'fig_title',
 ]
+
+_TEXT_COLOR = "#3F6469"
 
 
 # ==================== ==================== ==================== ====================
@@ -39,7 +43,32 @@ DISPATCH_COLORS = {
 
 
 # ==================== ==================== ==================== ====================
-# 1. dispatch
+# 1. title helper
+
+def fig_title(ax, title: str, subtitle: str = "") -> None:
+    """Bold declarative headline + italic subtitle above axes, left-aligned.
+
+    Usage:
+        fig_title(ax, "Vindkraft dækker vinteren", "Ugentlig dispatch, 2025-26 (x = 50 %)")
+    """
+    base = mpl.rcParams["font.size"]
+    ax.set_title(
+        title, loc="left", fontstyle="normal", fontweight="bold",
+        fontsize=base + 1, color=_TEXT_COLOR,
+        pad=base + 16 if subtitle else 10,
+    )
+    if subtitle:
+        ax.annotate(
+            subtitle,
+            xy=(0, 1), xycoords="axes fraction",
+            xytext=(0, 10), textcoords="offset points",
+            fontsize=base - 2, fontstyle="italic",
+            color=_TEXT_COLOR, va="bottom", ha="left",
+        )
+
+
+# ==================== ==================== ==================== ====================
+# 2. dispatch
 
 def _dispatch_from_lp(lp: dict, demand_mw: float) -> dict:
     """LP-consistent demand attribution from cached LP arrays."""
@@ -171,7 +200,7 @@ def battery_detail(ve, solar_cf, wind_cf):
 
 
 # ==================== ==================== ==================== ====================
-# 2. plotting
+# 3. plotting
 
 def _align_zeros(ax1, ax2):
     """Expand lower limits so zero sits at the same fractional height on both axes."""
@@ -201,7 +230,7 @@ def _month_ticks(idx):
     return ticks, labels
 
 
-def plot_dispatch(d_agg, idx, ylabel, save_path=None):
+def plot_dispatch(d_agg, idx, ylabel, save_path=None, title="", subtitle=""):
     """
     Stacked area dispatch plot for a VE scenario.
     Positive stacks: grid, battery, wind, pv. Negative fill: export.
@@ -218,7 +247,7 @@ def plot_dispatch(d_agg, idx, ylabel, save_path=None):
         linewidth=0,
     )
     ax.fill_between(x, 0, -d_agg['exported'],
-                    label='Eksport', color=C['exported'], linewidth=0)
+                    label='Neteksport', color=C['exported'], linewidth=0)
 
     ax.set_xlim(0, len(idx) - 1)
     ax.set_ylabel(ylabel)
@@ -232,6 +261,8 @@ def plot_dispatch(d_agg, idx, ylabel, save_path=None):
               loc='upper center', bbox_to_anchor=(0.5, -0.12),
               ncol=len(labels))
 
+    if title:
+        fig_title(ax, title, subtitle)
     plt.tight_layout()
     if save_path:
         pathlib.Path(save_path).parent.mkdir(exist_ok=True)
@@ -240,7 +271,7 @@ def plot_dispatch(d_agg, idx, ylabel, save_path=None):
     return fig, ax
 
 
-def plot_battery(b, idx, save_path=None):
+def plot_battery(b, idx, save_path=None, title="", subtitle=""):
     """
     Single-figure battery plot with twin y-axes.
     Left: state of charge (MWh, blue fill). Right: charge/discharge (MW, lines).
@@ -252,13 +283,13 @@ def plot_battery(b, idx, save_path=None):
     ax_flow = ax_soc.twinx()
 
     ax_soc.fill_between(x, 0, b['soc'] / 1e3,
-                        color=C['wind'], alpha=0.35, linewidth=0, label='SOC')
-    ax_soc.set_ylabel('GWh stored')
+                        color=C['wind'], alpha=0.35, linewidth=0, label='Lagerbeholdning')
+    ax_soc.set_ylabel('GWh lagret')
     ax_soc.set_xlim(0, len(idx) - 1)
 
-    ax_flow.plot(x, b['charge'],         color='#E8A09E', linewidth=1.5, label='Charge')
-    ax_flow.plot(x, b['discharge_dc'],   color='#C0504D', linewidth=1.5, label='Discharge — datacenter')
-    ax_flow.plot(x, b['discharge_grid'], color='#1A1A1A', linewidth=1.5, label='Discharge — grid')
+    ax_flow.plot(x, b['charge'],         color='#E8A09E', linewidth=1.5, label='Oplag')
+    ax_flow.plot(x, b['discharge_dc'],   color='#C0504D', linewidth=1.5, label='Aflad (datacenter)')
+    ax_flow.plot(x, b['discharge_grid'], color='#1A1A1A', linewidth=1.5, label='Aflad (grid)')
     ax_flow.set_ylabel('MW')
 
     ticks, labs = _month_ticks(idx)
@@ -272,6 +303,8 @@ def plot_battery(b, idx, save_path=None):
                   ncol=len(h1) + len(h2))
 
     _align_zeros(ax_soc, ax_flow)
+    if title:
+        fig_title(ax_soc, title, subtitle)
     plt.tight_layout()
     if save_path:
         pathlib.Path(save_path).parent.mkdir(exist_ok=True)
