@@ -26,7 +26,7 @@ KK_datacentre/
 ├── pylib/
 │   ├── setup.py          # Notebook preamble: autoreload, AEJ style, standard imports + mdates
 │   └── ve_dispatch.py    # Dispatch detail, aggregation, and plotting
-│                         # (DISPATCH_COLORS, MAANED_DK, MAANED_EN, plot_dispatch, plot_battery)
+│                         # (DISPATCH_COLORS, MAANED_DK, MAANED_EN, plot_dispatch, plot_battery, fig_title)
 │
 ├── 1_input.ipynb         # Fetches and saves variation pattern files via ET-eds-api
 ├── 2_model.ipynb         # Builds and runs the model, prints results, saves VE solution
