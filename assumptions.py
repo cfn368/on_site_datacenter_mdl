@@ -55,11 +55,13 @@ wind_tech = Tech(
 # Power (MW) and energy (MWh) are sized independently by the optimiser.
 
 battery = Battery(
-    capex_power   = 80_000,    # €/MW  (power component)  [DEA 2030]
-    capex_energy  = 200_000,   # €/MWh (energy + other project costs)  [DEA 2030]
-    opex_fixed    = 8_100,     # €/MW/yr  [DEA 2030]
-    lifetime      = 20,        # years  [DEA 2030]
-    discount_rate = DISCOUNT_RATE,
+    capex_power    = 80_000,    # €/MW  (power component)  [DEA 2030]
+    capex_energy   = 200_000,   # €/MWh (energy + other project costs)  [DEA 2030]
+    opex_fixed     = 8_100,     # €/MW/yr  [DEA 2030]
+    lifetime       = 20,        # years  [DEA 2030]
+    discount_rate  = DISCOUNT_RATE,
+    eta_charge     = 0.98,      # DC charge efficiency  [DEA 2030]
+    eta_discharge  = 0.97,      # DC discharge efficiency  [DEA 2030]
 )
 
 # ── demand ────────────────────────────────────────────────────────────────────

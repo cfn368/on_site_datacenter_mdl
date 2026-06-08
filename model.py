@@ -47,6 +47,8 @@ class Battery:
     opex_fixed:    float   # €/MW/yr on power rating
     lifetime:      int
     discount_rate: float
+    eta_charge:    float = 1.0   # DC charge efficiency [0, 1]
+    eta_discharge: float = 1.0   # DC discharge efficiency [0, 1]
 
     @property
     def crf(self) -> float:
@@ -288,20 +290,22 @@ class VESupply:
         sold          = np.zeros(self.demand.HOURS)
         soc           = 0.0
         shortfall_mwh = 0.0
+        eta_c         = self.battery.eta_charge
+        eta_d         = self.battery.eta_discharge
 
         for t in range(self.demand.HOURS):
             a = avail[t]
             if a >= floor:
                 surplus    = a - floor
-                charge     = min(surplus, batt_power, batt_energy - soc)
-                soc       += charge
+                charge     = min(surplus, batt_power, (batt_energy - soc) / eta_c)
+                soc       += eta_c * charge
                 consume    = min(a - charge, self.demand.demand_mw)
                 sold[t]    = min(max(0.0, a - charge - self.demand.demand_mw), self.demand.grid_cap_mw)
                 onsite[t]  = consume
             else:
                 deficit    = floor - a
-                discharge  = min(deficit, batt_power, soc)
-                soc       -= discharge
+                discharge  = min(deficit, batt_power, soc * eta_d)
+                soc       -= discharge / eta_d
                 onsite[t]  = a + discharge
                 shortfall_mwh += max(0.0, floor - onsite[t])
         return onsite, sold, shortfall_mwh
@@ -346,8 +350,10 @@ class VESupply:
         A_en  = hstack([I, -I, Z, -I, I, I, I, Z], format='csr')
         b_en  = ve - d
 
-        # SOC recurrence (equality): -charge + discharge + L*soc = 0
-        A_soc = hstack([-I, I, L, Z, Z, Z, Z, Z], format='csr')
+        # SOC recurrence (equality): -η_c·charge + (1/η_d)·discharge + L·soc = 0
+        eta_c = self.battery.eta_charge
+        eta_d = self.battery.eta_discharge
+        A_soc = hstack([-eta_c * I, (1.0 / eta_d) * I, L, Z, Z, Z, Z, Z], format='csr')
         b_soc = np.zeros(T)
 
         A_eq = vstack([A_en, A_soc], format='csr')
@@ -447,7 +453,9 @@ class VESupply:
 
         # ── SOC recurrence (equality, T rows) ─────────────────────────────────
 
-        A_soc_eq = hstack([Zc, -I, I, L, Z, Z, Z, Z, Z], format='csr')
+        eta_c    = self.battery.eta_charge
+        eta_d    = self.battery.eta_discharge
+        A_soc_eq = hstack([Zc, -eta_c * I, (1.0 / eta_d) * I, L, Z, Z, Z, Z, Z], format='csr')
 
         A_eq = vstack([A_en, A_soc_eq], format='csr')
         b_eq = np.concatenate([np.full(T, -d), np.zeros(T)])
