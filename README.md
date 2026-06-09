@@ -34,7 +34,12 @@ KK_datacentre/
 ├── 4_cases.ipynb         # Multi-year, multi-x results table
 │
 ├── variation_patterns/   # 8760-row input files (one value per line, dot-decimal)
-├── runs/                 # ve_solution.json, ve_lp_arrays.npz, lp_arrays/ — cached VE solution
+├── runs/
+│   ├── ve_solution.json  # Cached optimal capacities (c_solar, c_wind, batt_power, batt_energy)
+│   ├── ve_lp_arrays.npz  # Cached LP dispatch arrays (binary)
+│   └── lp_arrays/        # All key model time series as plain-text txt files (one value per line):
+│                         # charge, discharge, soc, grid_buy, grid_sell, curtail, curtail_pv,
+│                         # curtail_wl, cfe_excess, pv_gen, wl_gen
 └── figures/              # Output figures
 ```
 
