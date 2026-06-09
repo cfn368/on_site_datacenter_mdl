@@ -275,20 +275,19 @@ class VESupply:
     # ── simulation ────────────────────────────────────────────────────────────
 
     def _simulate(
-        self, c_solar: float, c_wind: float, batt_power: float, batt_energy: float
-    ) -> tuple[np.ndarray, np.ndarray, float]:
+        self, c_solar: float, c_wind: float, batt_power: float, batt_energy: float,
+        soc_init: float = 0.0,
+    ) -> tuple[np.ndarray, np.ndarray, float, float]:
         """
         Greedy dispatch. Battery charges from VE surplus above floor; discharges to
         cover shortfalls. Any VE above demand_mw after charging is exported.
-        SOC initialised at 0 (worst-case for opening hours).
-        Returns (onsite MW, exported MW, cfe_shortfall_mwh).
-        cfe_shortfall_mwh = 0 means fully feasible.
+        Returns (onsite MW, exported MW, cfe_shortfall_mwh, final_soc).
         """
         floor         = self.demand.floor_mw
         avail         = c_solar * self.solar_cf + c_wind * self.wind_cf
         onsite        = np.empty(self.demand.HOURS)
         sold          = np.zeros(self.demand.HOURS)
-        soc           = 0.0
+        soc           = soc_init
         shortfall_mwh = 0.0
         eta_c         = self.battery.eta_charge
         eta_d         = self.battery.eta_discharge
@@ -308,7 +307,14 @@ class VESupply:
                 soc       -= discharge / eta_d
                 onsite[t]  = a + discharge
                 shortfall_mwh += max(0.0, floor - onsite[t])
-        return onsite, sold, shortfall_mwh
+        return onsite, sold, shortfall_mwh, soc
+
+    def _simulate_cyclic(
+        self, c_solar: float, c_wind: float, batt_power: float, batt_energy: float,
+    ) -> tuple[np.ndarray, np.ndarray, float, float]:
+        """Two-pass greedy: first pass finds end-of-year SOC; second pass starts there."""
+        _, _, _, soc_end = self._simulate(c_solar, c_wind, batt_power, batt_energy)
+        return self._simulate(c_solar, c_wind, batt_power, batt_energy, soc_end)
 
     # ── LP dispatch (perfect foresight) ──────────────────────────────────────
 
@@ -339,7 +345,10 @@ class VESupply:
 
         I = speye(T, format='csr')
         Z = csr_matrix((T, T))
-        L = diags([np.ones(T), -np.ones(T - 1)], [0, -1], shape=(T, T), format='csr')
+        # Cyclic L: L[0, T-1] = -1 makes the t=0 row use soc[T-1] as the prior SOC
+        # instead of implicitly assuming soc_init = 0.
+        L = (diags([np.ones(T), -np.ones(T - 1)], [0, -1], shape=(T, T), format='csr')
+             + csr_matrix(([-1.0], ([0], [T - 1])), shape=(T, T)))
 
         # objective: min Σ [(price+buy_tariff)*grid_buy - (price-sell_tariff)*grid_sell + M*cfe_excess]
         # curtail_wl has cost -opex_var: LP saves wind O&M by curtailing wind before solar
@@ -440,7 +449,9 @@ class VESupply:
 
         I  = speye(T, format='csr')
         Z  = csr_matrix((T, T))
-        L  = diags([np.ones(T), -np.ones(T - 1)], [0, -1], shape=(T, T), format='csr')
+        # Cyclic L: soc[T-1] acts as prior SOC for t=0 (true annual cycle).
+        L  = (diags([np.ones(T), -np.ones(T - 1)], [0, -1], shape=(T, T), format='csr')
+              + csr_matrix(([-1.0], ([0], [T - 1])), shape=(T, T)))
         Zc = csr_matrix((T, N_cap))
 
         # ── energy balance (equality, T rows) ─────────────────────────────────
@@ -550,11 +561,11 @@ class VESupply:
         Returns None if infeasible even at bisect_upper_energy.
         """
         lo, hi = 0.0, self.bisect_upper_energy
-        if self._simulate(c_solar, c_wind, batt_power, hi)[2] > 0:
+        if self._simulate_cyclic(c_solar, c_wind, batt_power, hi)[2] > 0:
             return None
         while hi - lo > self.tol_energy:
             mid = (lo + hi) / 2.0
-            if self._simulate(c_solar, c_wind, batt_power, mid)[2] == 0:
+            if self._simulate_cyclic(c_solar, c_wind, batt_power, mid)[2] == 0:
                 hi = mid
             else:
                 lo = mid
@@ -592,7 +603,7 @@ class VESupply:
                 return 1e15
             return self._onsite_cost(c_solar, c_wind, batt_power, batt_energy) + sol['lp_obj']
 
-        onsite, sold, shortfall_mwh = self._simulate(c_solar, c_wind, batt_power, batt_energy)
+        onsite, sold, shortfall_mwh, _ = self._simulate_cyclic(c_solar, c_wind, batt_power, batt_energy)
         cost  = self._onsite_cost(c_solar, c_wind, batt_power, batt_energy)
         cost += shortfall_mwh * self.cfe_penalty
         return cost
@@ -718,7 +729,7 @@ class VESupply:
             lp = self.lp_detail()
             return np.full(self.demand.HOURS, self.demand.demand_mw) - lp['grid_buy']
         c_solar, c_wind, batt_power, batt_energy = self.solution
-        return self._simulate(c_solar, c_wind, batt_power, batt_energy)[0]
+        return self._simulate_cyclic(c_solar, c_wind, batt_power, batt_energy)[0]
 
     def lp_detail(self) -> dict | None:
         """All LP arrays for the optimised solution (single LP). None if no prices."""
@@ -747,7 +758,7 @@ class VESupply:
             grid_import_mwh = float(grid_buy.sum())
             grid_sell_mwh   = float(grid_sell.sum())
         else:
-            onsite, sold, shortfall_mwh = self._simulate(c_solar, c_wind, batt_power, batt_energy)
+            onsite, sold, shortfall_mwh, _ = self._simulate_cyclic(c_solar, c_wind, batt_power, batt_energy)
             grid_cost       = grid.cost(onsite)
             export_revenue  = float((sold * np.maximum(grid.prices, 0.0)).sum())
             grid_import_mwh = float(grid.imports(onsite).sum())
