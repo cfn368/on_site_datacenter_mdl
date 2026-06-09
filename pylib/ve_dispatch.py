@@ -35,6 +35,7 @@ MAANED_EN = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
 DISPATCH_COLORS = {
     'grid':     '#C9C0B8',   # warm light grey  — grid import
     'battery':  '#C0504D',   # brick red         — battery discharge
+    'charge':   '#E8A09E',   # light salmon      — battery charge
     'wind':     '#5B9BD5',   # cornflower blue   — wind
     'pv':       '#F2C94C',   # amber gold        — solar
     'exported': '#8C7B72',   # warm medium grey  — grid export (same family as import)
@@ -82,6 +83,7 @@ def _dispatch_from_lp(lp: dict, demand_mw: float) -> dict:
         pv       = ve_to_demand * frac_pv,
         wind     = ve_to_demand * (1.0 - frac_pv),
         battery  = batt_to_demand,
+        charge   = lp['charge'],
         grid     = grid_to_demand,
         exported = lp['grid_sell'],
     )
@@ -139,7 +141,7 @@ def dispatch_detail(ve, solar_cf, wind_cf):
     grid_import = np.clip(demand_mw - ve_consumed - batt_discharge, 0.0, grid_cap)
 
     return dict(pv=pv_demand, wind=wl_demand, battery=batt_discharge,
-                grid=grid_import, exported=exported)
+                charge=batt_charge, grid=grid_import, exported=exported)
 
 
 def aggregate_dispatch(d, dates, freq):
@@ -237,17 +239,20 @@ def plot_dispatch(d_agg, idx, ylabel, save_path=None, title="", subtitle=""):
     """
     x = np.arange(len(idx))
     C = DISPATCH_COLORS
-    fig, ax = plt.subplots(figsize=(12, 6))
+    fig, ax = plt.subplots(figsize=(12, 7))
 
     ax.stackplot(
         x,
         d_agg['grid'], d_agg['battery'], d_agg['wind'], d_agg['pv'],
-        labels=['Netimport', 'Batteri', 'Vindkraft', 'Solkraft'],
+        labels=['Køb', 'Batteriafladning', 'Vind', 'Sol'],
         colors=[C['grid'], C['battery'], C['wind'], C['pv']],
         linewidth=0,
     )
-    ax.fill_between(x, 0, -d_agg['exported'],
-                    label='Neteksport', color=C['exported'], linewidth=0)
+    neg_base = -d_agg['exported']
+    ax.fill_between(x, 0, neg_base,
+                    label='Salg', color=C['exported'], linewidth=0)
+    ax.fill_between(x, neg_base, neg_base - d_agg['charge'],
+                    label='Batteriladning', color=C['charge'], linewidth=0)
 
     ax.set_xlim(0, len(idx) - 1)
     ax.set_ylabel(ylabel)
@@ -257,9 +262,11 @@ def plot_dispatch(d_agg, idx, ylabel, save_path=None, title="", subtitle=""):
     ax.set_xticklabels(labs)
 
     handles, labels = ax.get_legend_handles_labels()
-    ax.legend(handles[::-1], labels[::-1],
+    lut = dict(zip(labels, handles))
+    order = ['Vind', 'Sol', 'Batteriladning', 'Batteriafladning', 'Køb', 'Salg']
+    ax.legend([lut[l] for l in order], order,
               loc='upper center', bbox_to_anchor=(0.5, -0.12),
-              ncol=len(labels))
+              ncol=len(order))
 
     if title:
         fig_title(ax, title, subtitle)
