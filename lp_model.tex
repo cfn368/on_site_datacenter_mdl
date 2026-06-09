@@ -174,13 +174,15 @@ Technology & Parameter & Value & Unit & Source \\
   & Lifetime                &      30 & yr        & DEA 2030 \\
   & CRF$(4\%,\,30)$         &    5.78 & \%        & derived \\
 \midrule
-\multirow{6}{*}{Battery (BESS)}
+\multirow{8}{*}{Battery (BESS)}
   & Power capex             &      80 & k€/MW     & DEA 2030 \\
   & Energy capex            &     200 & k€/MWh    & DEA 2030 \\
   & Fixed O\&M (on power)   &   8{,}100 & €/MW/yr & DEA 2030 \\
   & Lifetime                &      20 & yr        & DEA 2030 \\
   & Duration sh             &       4 & h         & assumed \\
   & CRF$(4\%,\,20)$         &    7.36 & \%        & derived \\
+  & Charge efficiency $\eta_c$ &   98 & \%        & DEA 2030 \\
+  & Discharge efficiency $\eta_d$ & 97 & \%       & DEA 2030 \\
 \midrule
 \multirow{4}{*}{Grid tariffs}
   & Buy tariff $\tau^+$     &   11.66 & €/MWh     & Energinet \\
@@ -221,6 +223,7 @@ $\text{CF}^s_t,\,\text{CF}^w_t$ & — & solar / wind capacity factor at hour $t$
 $p_t$ & €/MWh & spot price at hour $t$ \\
 $\tau^+,\,\tau^-$ & €/MWh & grid buy / sell tariff ($11.66$ / $1.54$) \\
 $\eta$ & €/MWh & wind variable O\&M ($1.98$) \\
+$\eta_c,\,\eta_d$ & — & DC charge / discharge efficiency ($0.98$ / $0.97$) \\
 $M$ & €/MWh & CFE penalty ($10^6$) \\
 \bottomrule
 \end{tabularx}}
@@ -335,16 +338,26 @@ the air; any surplus must be exported, stored, or curtailed.
 The battery state of charge evolves as:
 
 \begin{equation}
-  s_t = s_{t-1} + u_t - d_t
-  \quad \forall\, t, \qquad s_0 = 0
+  s_t = s_{t-1} + \eta_c\, u_t - \frac{d_t}{\eta_d}
+  \quad \forall\, t
   \label{eq:soc}
 \end{equation}
 
-Initialising at $s_0 = 0$ is a conservative worst-case assumption: the battery
-is empty at the start of the year, so any deficit in the opening hours must be
-covered by grid import or VE generation without battery help. In practice the
-LP wraps around by choosing a dispatch profile that leaves the battery at a
-useful level throughout.
+where $u_t$ and $d_t$ are the AC-side charge and discharge flows (matching the
+energy balance), so that $\eta_c$ and $\eta_d$ capture only the DC cell-level
+losses. The solar capacity factors are measured at the grid metering point
+(AC output of the inverter), so inverter losses are already embedded in the
+input data and must not be double-counted here.
+
+\textbf{Cyclic initial condition.} Rather than assuming $s_{-1} = 0$, the SOC
+recurrence uses a cyclic L matrix with $L_{0,\,T-1} = -1$. This makes the
+implicit prior SOC at $t = 0$ equal to $s_{T-1}$ (the end-of-year state),
+enforcing a self-consistent annual cycle: the battery neither accumulates nor
+drains net energy across the year. In matrix form, the t=0 row reads
+$s_0 - s_{T-1} = \eta_c u_0 - d_0/\eta_d$ rather than $s_0 = \eta_c u_0 -
+d_0/\eta_d$. For typical Danish weather data the constraint is nearly
+non-binding (the battery naturally empties by year-end), but it is correct
+by construction.
 
 \subsubsection*{CFE constraint (T inequalities)}
 
@@ -378,8 +391,9 @@ separately — the inverter ($P_b$, MW) and the cell stack ($E_b$, MWh). Their
 ratio is fixed by a configurable parameter: $E_b = \text{sh} \times P_b$
 where $\text{sh} = 4$\,h is set exogenously, so only $P_b$ is a free LP
 variable (reducing capacity variables to 3). Setting $\text{sh} = \texttt{None}$
-promotes $E_b$ to a fourth free variable with its own capex term. The model
-treats storage as lossless (no round-trip efficiency loss).
+promotes $E_b$ to a fourth free variable with its own capex term. Round-trip
+efficiency losses are modelled in the SOC recurrence \eqref{eq:soc}; the
+bounds here apply to the AC-side flows.
 
 \subsubsection*{Curtailment bounds (2T inequalities)}
 

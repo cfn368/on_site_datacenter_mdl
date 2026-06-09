@@ -5,7 +5,7 @@ Sources tagged inline:
   [ET]  — Erhvervslivets Tænketank
   [DEA] — Danish Energy Agency, Technology Data (2030-column values for VE)
 """
-from model import Tech, Battery, DatacenterDemand
+from pylib.model import Tech, Battery, DatacenterDemand
 
 # ── common ────────────────────────────────────────────────────────────────────
 

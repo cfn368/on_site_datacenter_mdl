@@ -21,6 +21,8 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import matplotlib.dates as mdates
 
+import pylib.model
+import pylib.assumptions
 import pylib.ve_dispatch
 from pylib.ve_dispatch import *   # noqa: F401, F403
 
@@ -79,7 +81,7 @@ def setup_notebook(*, autoreload: int = 2, aej: bool = True, **aej_kwargs) -> No
 
     enable_autoreload(autoreload)
 
-    for name in ("pylib.ve_dispatch",):
+    for name in ("pylib.model", "pylib.assumptions", "pylib.ve_dispatch"):
         if name in sys.modules:
             importlib.reload(sys.modules[name])
 

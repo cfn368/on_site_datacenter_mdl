@@ -19,11 +19,11 @@ Raw production series are divided by fleet capacity to obtain hourly capacity fa
 
 ```
 KK_datacentre/
-├── model.py              # Core model: DatacenterDemand, GridSupply, KKSupply, VESupply, DatacenterModel
-├── assumptions.py        # All cost and technical parameters — import from here, never hardcode
 ├── lp_model.tex          # Full LP documentation: variables, objective, constraints, economic intuition
 │
 ├── pylib/
+│   ├── model.py          # Core model: DatacenterDemand, GridSupply, KKSupply, VESupply, DatacenterModel
+│   ├── assumptions.py    # All cost and technical parameters — import from here, never hardcode
 │   ├── setup.py          # Notebook preamble: autoreload, AEJ style, standard imports + mdates
 │   └── ve_dispatch.py    # Dispatch detail, aggregation, and plotting
 │                         # (DISPATCH_COLORS, MAANED_DK, MAANED_EN, plot_dispatch, plot_battery, fig_title)
@@ -50,7 +50,9 @@ Total KK cost has three components: (1) annualised reactor capex and O&M (~31 �
 
 The VE operator faces a harder problem. Solar and wind are intermittent, the battery has limited storage, and the on-site floor must be met every hour. The operator chooses how much solar, wind, and battery power to install, then dispatches them optimally against hourly spot prices.
 
-The entire problem — capacities and all 8,760-hour dispatch decisions — is solved as a single linear programme (HiGHS via `scipy.optimize.linprog`). The battery is fully bidirectional: it charges from VE surplus or cheap grid electricity and discharges to the datacenter or the grid. The on-site fraction requirement is enforced hourly. Grid purchases carry an 8.7 øre/kWh consumption tariff; grid sales carry a 1.15 øre/kWh production tariff; both enter the LP objective so the optimiser internalises them.
+The entire problem — capacities and all 8,760-hour dispatch decisions — is solved as a single linear programme (HiGHS via `scipy.optimize.linprog`). The battery is fully bidirectional: it charges from VE surplus or cheap grid electricity and discharges to the datacenter or the grid. Battery round-trip efficiency is modelled at the DC cell level: charge efficiency 98%, discharge efficiency 97% (DEA 2030). The on-site fraction requirement is enforced hourly. Grid purchases carry an 8.7 øre/kWh consumption tariff; grid sales carry a 1.15 øre/kWh production tariff; both enter the LP objective so the optimiser internalises them.
+
+The SOC recurrence uses a cyclic L matrix so that the start-of-year battery state equals the end-of-year state, removing the arbitrary assumption that the battery begins empty.
 
 Surplus VE is tracked separately as solar curtailment and wind curtailment. Wind carries a 1.98 €/MWh variable O&M on dispatched output, so curtailing wind saves money; the LP therefore always curtails wind before solar — this is an outcome of the cost structure, not a rule imposed externally.
 
