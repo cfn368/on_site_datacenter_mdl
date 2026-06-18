@@ -99,18 +99,23 @@ class Result:
         return s
 
 
+_FULL_YEAR_HOURS = 8760   # reference for season_frac = demand.HOURS / _FULL_YEAR_HOURS
+
+
 # ── layer 1: demand ───────────────────────────────────────────────────────────
 
 class DatacenterDemand:
     """
     Flat-load datacenter. x is the legally required on-site fraction [0, 1].
     All sizing and cost comparisons are relative to this demand.
+    hours defaults to 8760 (full year); pass a seasonal T_sub for sub-annual runs.
     """
-    HOURS: int = 8760
+    HOURS: int = 8760   # class-level default; overridden as instance attr when hours≠8760
 
-    def __init__(self, demand_mw: float = 1_000.0, x: float = 0.50):
+    def __init__(self, demand_mw: float = 1_000.0, x: float = 0.50, hours: int = 8760):
         self.demand_mw = demand_mw
         self.x = x
+        self.HOURS = hours
 
     @property
     def floor_mw(self) -> float:
@@ -194,8 +199,10 @@ class KKSupply:
         return d
 
     def annual_cost(self) -> float:
+        sf             = self.demand.HOURS / _FULL_YEAR_HOURS
         generation_mwh = self.capacity_mw * (self.demand.HOURS - self.downtime_hours)
-        return self.tech.annual_cost(self.capacity_mw, generation_mwh)
+        fixed = (self.tech.capex * self.tech.crf + self.tech.opex_fixed) * self.capacity_mw * sf
+        return fixed + self.tech.opex_var * generation_mwh
 
     def result(self, grid: GridSupply) -> Result:
         outage          = self._outage_mask()
@@ -251,7 +258,7 @@ class VESupply:
         tol_ve:              float = 1.0,           # MW  — outer Nelder-Mead tolerance
     ):
         if len(solar_cf) != demand.HOURS or len(wind_cf) != demand.HOURS:
-            raise ValueError("Capacity factor arrays must be length 8760")
+            raise ValueError(f"Capacity factor arrays must match demand.HOURS ({demand.HOURS})")
         if prices is not None and len(prices) != demand.HOURS:
             raise ValueError("prices must be length 8760")
         self.solar_cf            = solar_cf
@@ -426,21 +433,23 @@ class VESupply:
         N_cap  = 4 if free_e else 3
 
         # ── capacity cost coefficients ────────────────────────────────────────
+        # Fixed components (capex×CRF + opex_fixed) are pro-rated by the fraction of the
+        # full year covered by demand.HOURS — so seasonal runs bear only their share of
+        # annual capital costs. Variable O&M is already seasonal (charged on actual dispatch).
 
-        c_solar_coef = (self.solar_tech.capex * self.solar_tech.crf
-                        + self.solar_tech.opex_fixed
+        sf           = self.demand.HOURS / _FULL_YEAR_HOURS
+        c_solar_coef = ((self.solar_tech.capex * self.solar_tech.crf + self.solar_tech.opex_fixed) * sf
                         + self.solar_tech.opex_var * float(self.solar_cf.sum()))
-        c_wind_coef  = (self.wind_tech.capex * self.wind_tech.crf
-                        + self.wind_tech.opex_fixed
+        c_wind_coef  = ((self.wind_tech.capex * self.wind_tech.crf + self.wind_tech.opex_fixed) * sf
                         + self.wind_tech.opex_var * float(self.wind_cf.sum()))
         if free_e:
             cap_costs = [c_solar_coef, c_wind_coef,
-                         self.battery.capex_power * self.battery.crf + self.battery.opex_fixed,
-                         self.battery.capex_energy * self.battery.crf]
+                         (self.battery.capex_power * self.battery.crf + self.battery.opex_fixed) * sf,
+                         self.battery.capex_energy * self.battery.crf * sf]
         else:
             cap_costs = [c_solar_coef, c_wind_coef,
-                         (self.battery.capex_power + self.battery.capex_energy * sh)
-                         * self.battery.crf + self.battery.opex_fixed]
+                         ((self.battery.capex_power + self.battery.capex_energy * sh) * self.battery.crf
+                          + self.battery.opex_fixed) * sf]
 
         c_obj = np.concatenate([cap_costs, np.zeros(3 * T), p + self.buy_tariff, -p + self.sell_tariff,
                                  np.zeros(T), np.full(T, -self.wind_tech.opex_var), np.full(T, M)])
@@ -576,13 +585,16 @@ class VESupply:
     def _onsite_cost(
         self, c_solar: float, c_wind: float, batt_power: float, batt_energy: float
     ) -> float:
-        solar_mwh = float(c_solar * self.solar_cf.sum())
-        wind_mwh  = float(c_wind  * self.wind_cf.sum())
-        return (
-            self.solar_tech.annual_cost(c_solar, solar_mwh)
-            + self.wind_tech.annual_cost(c_wind, wind_mwh)
-            + self.battery.annual_cost(batt_power, batt_energy)
-        )
+        sf         = self.demand.HOURS / _FULL_YEAR_HOURS
+        solar_mwh  = float(c_solar * self.solar_cf.sum())
+        wind_mwh   = float(c_wind  * self.wind_cf.sum())
+        solar_cost = ((self.solar_tech.capex * self.solar_tech.crf + self.solar_tech.opex_fixed) * c_solar * sf
+                      + self.solar_tech.opex_var * solar_mwh)
+        wind_cost  = ((self.wind_tech.capex  * self.wind_tech.crf  + self.wind_tech.opex_fixed)  * c_wind  * sf
+                      + self.wind_tech.opex_var  * wind_mwh)
+        batt_cost  = ((self.battery.capex_power * batt_power + self.battery.capex_energy * batt_energy) * self.battery.crf
+                      + self.battery.opex_fixed * batt_power) * sf
+        return solar_cost + wind_cost + batt_cost
 
     def _objective(self, params: np.ndarray) -> float:
         c_solar    = max(0.0, float(params[0]))
