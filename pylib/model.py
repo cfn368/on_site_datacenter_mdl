@@ -79,6 +79,8 @@ class Result:
     cfe_shortfall_mwh:       float = 0.0  # VE only (MWh/yr floor unmet; 0 = fully feasible)
     annual_tariff_cost:      float = 0.0  # VE only (grid consumption + production tariffs)
     annual_grid_connect:     float = 0.0  # VE only (annualised tilslutningsbidrag)
+    annual_inv_cost:         float = 0.0  # capex × CRF (season-prorated)
+    annual_om_cost:          float = 0.0  # opex_fixed + opex_var (season-prorated fixed, actual variable)
 
     def __repr__(self) -> str:
         if self.label == "KK":
@@ -211,6 +213,10 @@ class KKSupply:
         grid_cost       = float((self.prices[outage] * self.capacity_mw).sum())
         tariff_cost     = self.buy_tariff * grid_import_mwh
         total           = onsite_cost + grid_cost + tariff_cost + self.grid_connect_annual
+        sf              = self.demand.HOURS / _FULL_YEAR_HOURS
+        generation_mwh  = self.capacity_mw * (self.demand.HOURS - self.downtime_hours)
+        inv_cost        = self.tech.capex * self.tech.crf * self.capacity_mw * sf
+        om_cost         = self.tech.opex_fixed * self.capacity_mw * sf + self.tech.opex_var * generation_mwh
         return Result(
             label               = "KK",
             onsite_capacity_mw  = self.capacity_mw,
@@ -221,6 +227,8 @@ class KKSupply:
             grid_import_mwh     = grid_import_mwh,
             annual_tariff_cost  = tariff_cost,
             annual_grid_connect = self.grid_connect_annual,
+            annual_inv_cost     = inv_cost,
+            annual_om_cost      = om_cost,
         )
 
 
@@ -778,6 +786,17 @@ class VESupply:
 
         tariff_cost = self.buy_tariff * grid_import_mwh + self.sell_tariff * grid_sell_mwh
         total = onsite_cost + grid_cost - export_revenue + tariff_cost + self.grid_connect_annual
+        sf      = self.demand.HOURS / _FULL_YEAR_HOURS
+        inv_cost = (
+            self.solar_tech.capex * self.solar_tech.crf * c_solar
+            + self.wind_tech.capex  * self.wind_tech.crf  * c_wind
+            + (self.battery.capex_power * batt_power + self.battery.capex_energy * batt_energy) * self.battery.crf
+        ) * sf
+        om_cost = (
+            self.solar_tech.opex_fixed * c_solar
+            + self.wind_tech.opex_fixed  * c_wind
+            + self.battery.opex_fixed   * batt_power
+        ) * sf + self.wind_tech.opex_var * float(c_wind * self.wind_cf.sum())
         return Result(
             label                  = "VE",
             c_solar_mw             = c_solar,
@@ -794,6 +813,8 @@ class VESupply:
             cfe_shortfall_mwh      = shortfall_mwh,
             annual_tariff_cost     = tariff_cost,
             annual_grid_connect    = self.grid_connect_annual,
+            annual_inv_cost        = inv_cost,
+            annual_om_cost         = om_cost,
         )
 
 
