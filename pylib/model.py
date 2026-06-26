@@ -81,10 +81,18 @@ class Result:
     annual_grid_connect:     float = 0.0  # VE only (annualised tilslutningsbidrag)
     annual_inv_cost:         float = 0.0  # capex × CRF (season-prorated)
     annual_om_cost:          float = 0.0  # opex_fixed + opex_var (season-prorated fixed, actual variable)
+    c_gas_mw:                float = 0.0  # VEGAS only: gas turbine capacity (MW)
 
     def __repr__(self) -> str:
         if self.label == "KK":
             cap = f"{self.onsite_capacity_mw:.0f} MW SMR"
+        elif self.label == "VEGAS":
+            cap = (
+                f"{self.c_solar_mw:.0f} MW PV + "
+                f"{self.c_wind_mw:.0f} MW wind + "
+                f"{self.batt_power_mw:.0f} MW / {self.batt_energy_mwh:.0f} MWh batt + "
+                f"{self.c_gas_mw:.0f} MW gas"
+            )
         else:
             cap = (
                 f"{self.c_solar_mw:.0f} MW PV + "
@@ -815,6 +823,266 @@ class VESupply:
             annual_grid_connect    = self.grid_connect_annual,
             annual_inv_cost        = inv_cost,
             annual_om_cost         = om_cost,
+        )
+
+
+# ── layer 3c: VE + gas turbine on-site ───────────────────────────────────────
+
+class VEGasSupply:
+    """
+    Solar + wind + battery + gas turbine. LP-only (prices required).
+
+    Gas turbine is last in the merit order by cost: the LP dispatches it only when
+    VE + battery cannot meet the CFE floor and grid import is capped. Variable cost
+    includes fuel + tariff, so gas_tech.opex_var ≈ 91 €/MWh.
+
+    Variable layout: [c_solar, c_wind, batt_power (, batt_energy), c_gas,
+                      charge(T), discharge(T), soc(T), gas_gen(T),
+                      grid_buy(T), grid_sell(T), curtail_pv(T), curtail_wl(T), cfe_excess(T)]
+    """
+    def __init__(
+        self,
+        solar_cf:            np.ndarray,
+        wind_cf:             np.ndarray,
+        solar_tech:          Tech,
+        wind_tech:           Tech,
+        battery:             Battery,
+        gas_tech:            Tech,
+        demand:              DatacenterDemand,
+        prices:              np.ndarray,
+        storage_hours:       float | None = None,
+        buy_tariff:          float = 0.0,
+        sell_tariff:         float = 0.0,
+        grid_connect_annual: float = 0.0,
+        cfe_penalty:         float = 1e6,
+    ):
+        if len(solar_cf) != demand.HOURS or len(wind_cf) != demand.HOURS:
+            raise ValueError(f"CF arrays must match demand.HOURS ({demand.HOURS})")
+        if len(prices) != demand.HOURS:
+            raise ValueError("prices must be length demand.HOURS")
+        self.solar_cf            = solar_cf
+        self.wind_cf             = wind_cf
+        self.solar_tech          = solar_tech
+        self.wind_tech           = wind_tech
+        self.battery             = battery
+        self.gas_tech            = gas_tech
+        self.demand              = demand
+        self.prices              = prices
+        self.storage_hours       = storage_hours
+        self.buy_tariff          = buy_tariff
+        self.sell_tariff         = sell_tariff
+        self.grid_connect_annual = grid_connect_annual
+        self.cfe_penalty         = cfe_penalty
+        self._lp_cache: dict | None = None
+
+    def _single_lp(self) -> dict | None:
+        from scipy.sparse import eye as speye, diags, hstack, vstack, csr_matrix
+        from scipy.optimize import linprog
+
+        T      = self.demand.HOURS
+        d      = self.demand.demand_mw
+        g      = self.demand.grid_cap_mw
+        p      = self.prices
+        M      = self.cfe_penalty
+        sh     = self.storage_hours
+        free_e = (sh is None)
+        N_cap_ve = 4 if free_e else 3
+        N_cap    = N_cap_ve + 1   # + c_gas (always last capacity variable)
+
+        sf = self.demand.HOURS / _FULL_YEAR_HOURS
+
+        # ── capacity cost coefficients ─────────────────────────────────────────
+        c_solar_coef = ((self.solar_tech.capex * self.solar_tech.crf + self.solar_tech.opex_fixed) * sf
+                        + self.solar_tech.opex_var * float(self.solar_cf.sum()))
+        c_wind_coef  = ((self.wind_tech.capex * self.wind_tech.crf + self.wind_tech.opex_fixed) * sf
+                        + self.wind_tech.opex_var * float(self.wind_cf.sum()))
+        c_gas_coef   = (self.gas_tech.capex * self.gas_tech.crf + self.gas_tech.opex_fixed) * sf
+
+        if free_e:
+            cap_costs = [c_solar_coef, c_wind_coef,
+                         (self.battery.capex_power * self.battery.crf + self.battery.opex_fixed) * sf,
+                         self.battery.capex_energy * self.battery.crf * sf,
+                         c_gas_coef]
+        else:
+            cap_costs = [c_solar_coef, c_wind_coef,
+                         ((self.battery.capex_power + self.battery.capex_energy * sh) * self.battery.crf
+                          + self.battery.opex_fixed) * sf,
+                         c_gas_coef]
+
+        # dispatch order: charge, discharge, soc, gas_gen, grid_buy, grid_sell,
+        #                 curtail_pv, curtail_wl, cfe_excess  (9 blocks × T)
+        c_obj = np.concatenate([
+            cap_costs,
+            np.zeros(3 * T),                              # charge, discharge, soc
+            np.full(T, self.gas_tech.opex_var),           # gas_gen (fuel + O&M + tariff)
+            p + self.buy_tariff,                          # grid_buy
+            -p + self.sell_tariff,                        # grid_sell
+            np.zeros(T),                                  # curtail_pv
+            np.full(T, -self.wind_tech.opex_var),         # curtail_wl (saves wind O&M)
+            np.full(T, M),                                # cfe_excess
+        ])
+
+        # ── sparse blocks ──────────────────────────────────────────────────────
+        I  = speye(T, format='csr')
+        Z  = csr_matrix((T, T))
+        L  = (diags([np.ones(T), -np.ones(T - 1)], [0, -1], shape=(T, T), format='csr')
+              + csr_matrix(([-1.0], ([0], [T - 1])), shape=(T, T)))
+        Zc = csr_matrix((T, N_cap))
+
+        # energy balance (T equalities):
+        # sources (discharge, gas_gen, grid_buy) have -1; sinks (charge, grid_sell, curtail) have +1
+        # -c_solar·cf - c_wind·cf + charge - discharge - gas_gen - grid_buy + grid_sell + curtail = -d
+        cf_cols = [-self.solar_cf, -self.wind_cf] + [np.zeros(T)] * (N_cap - 2)
+        A_en = hstack([csr_matrix(np.column_stack(cf_cols)),
+                       I, -I, Z, -I, -I, I, I, I, Z], format='csr')
+
+        # SOC recurrence (T equalities): gas_gen is independent of battery state
+        eta_c = self.battery.eta_charge
+        eta_d = self.battery.eta_discharge
+        A_soc = hstack([Zc, -eta_c * I, (1.0 / eta_d) * I, L, Z, Z, Z, Z, Z, Z], format='csr')
+
+        A_eq = vstack([A_en, A_soc], format='csr')
+        b_eq = np.concatenate([np.full(T, -d), np.zeros(T)])
+
+        # CFE inequality: grid_buy - cfe_excess ≤ grid_cap_mw
+        A_cfe = hstack([Zc, Z, Z, Z, Z, I, Z, Z, Z, -I], format='csr')
+
+        # capacity bound inequalities
+        pw      = np.zeros((T, N_cap)); pw[:, 2]   = -1.0            # batt_power col
+        en      = np.zeros((T, N_cap))
+        en[:, 3 if free_e else 2] = -1.0 if free_e else -sh          # batt_energy or sh×batt_power
+        pv_cap  = np.zeros((T, N_cap)); pv_cap[:, 0]  = -self.solar_cf
+        wl_cap  = np.zeros((T, N_cap)); wl_cap[:, 1]  = -self.wind_cf
+        gas_cap = np.zeros((T, N_cap)); gas_cap[:, -1] = -1.0        # c_gas col (last)
+
+        A_ub = vstack([
+            A_cfe,
+            hstack([csr_matrix(pw),      I, Z, Z, Z, Z, Z, Z, Z, Z], format='csr'),  # charge ≤ batt_power
+            hstack([csr_matrix(pw),      Z, I, Z, Z, Z, Z, Z, Z, Z], format='csr'),  # discharge ≤ batt_power
+            hstack([csr_matrix(en),      Z, Z, I, Z, Z, Z, Z, Z, Z], format='csr'),  # soc ≤ E_batt
+            hstack([csr_matrix(gas_cap), Z, Z, Z, I, Z, Z, Z, Z, Z], format='csr'),  # gas_gen ≤ c_gas
+            hstack([csr_matrix(pv_cap),  Z, Z, Z, Z, Z, Z, I, Z, Z], format='csr'),  # curtail_pv ≤ pv_gen
+            hstack([csr_matrix(wl_cap),  Z, Z, Z, Z, Z, Z, Z, I, Z], format='csr'),  # curtail_wl ≤ wl_gen
+        ], format='csr')
+        b_ub = np.concatenate([np.full(T, g), np.zeros(6 * T)])
+
+        bounds = (
+            [(0.0, None)] * N_cap
+            + [(0.0, None)] * (3 * T)   # charge, discharge, soc
+            + [(0.0, d)]    * T         # gas_gen (loose; tight via gas capacity constraint)
+            + [(0.0, d)]    * T         # grid_buy ≤ demand_mw
+            + [(0.0, g)]    * T         # grid_sell ≤ grid_cap_mw
+            + [(0.0, None)] * (3 * T)   # curtail_pv, curtail_wl, cfe_excess
+        )
+
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub,
+                      A_eq=A_eq, b_eq=b_eq, bounds=bounds,
+                      method='highs', options={'disp': False})
+        if res.status != 0:
+            return None
+
+        x   = res.x
+        c_s = float(x[0])
+        c_w = float(x[1])
+        b_p = float(x[2])
+        b_e = float(x[3]) if free_e else sh * b_p
+        c_g = float(x[N_cap - 1])
+        off = N_cap
+
+        return {
+            'c_solar':     c_s,
+            'c_wind':      c_w,
+            'batt_power':  b_p,
+            'batt_energy': b_e,
+            'c_gas':       c_g,
+            'charge':      x[off + 0*T : off + 1*T],
+            'discharge':   x[off + 1*T : off + 2*T],
+            'soc':         x[off + 2*T : off + 3*T],
+            'gas_gen':     x[off + 3*T : off + 4*T],
+            'grid_buy':    x[off + 4*T : off + 5*T],
+            'grid_sell':   x[off + 5*T : off + 6*T],
+            'curtail_pv':  x[off + 6*T : off + 7*T],
+            'curtail_wl':  x[off + 7*T : off + 8*T],
+            'curtail':     x[off + 6*T : off + 7*T] + x[off + 7*T : off + 8*T],
+            'cfe_excess':  x[off + 8*T : off + 9*T],
+            'lp_obj':      float(res.fun),
+            'pv_gen':      c_s * self.solar_cf,
+            'wl_gen':      c_w * self.wind_cf,
+        }
+
+    def lp_detail(self) -> dict | None:
+        """All LP arrays for the optimised solution. None if LP not yet solved."""
+        if self._lp_cache is None:
+            self._lp_cache = self._single_lp()
+        return self._lp_cache
+
+    def result(self, grid: GridSupply) -> Result:
+        lp = self.lp_detail()
+        if lp is None:
+            raise RuntimeError("VEGasSupply LP failed — check inputs.")
+
+        c_solar     = lp['c_solar']
+        c_wind      = lp['c_wind']
+        batt_power  = lp['batt_power']
+        batt_energy = lp['batt_energy']
+        c_gas       = lp['c_gas']
+        gas_gen     = lp['gas_gen']
+        grid_buy    = lp['grid_buy']
+        grid_sell   = lp['grid_sell']
+
+        sf = self.demand.HOURS / _FULL_YEAR_HOURS
+
+        solar_cost   = ((self.solar_tech.capex * self.solar_tech.crf + self.solar_tech.opex_fixed) * c_solar * sf
+                        + self.solar_tech.opex_var * float(c_solar * self.solar_cf.sum()))
+        wind_cost    = ((self.wind_tech.capex * self.wind_tech.crf + self.wind_tech.opex_fixed) * c_wind * sf
+                        + self.wind_tech.opex_var * float(c_wind * self.wind_cf.sum()))
+        batt_cost    = ((self.battery.capex_power * batt_power + self.battery.capex_energy * batt_energy) * self.battery.crf
+                        + self.battery.opex_fixed * batt_power) * sf
+        gas_cap_cost = (self.gas_tech.capex * self.gas_tech.crf + self.gas_tech.opex_fixed) * c_gas * sf
+        gas_var_cost = self.gas_tech.opex_var * float(gas_gen.sum())
+        onsite_cost  = solar_cost + wind_cost + batt_cost + gas_cap_cost + gas_var_cost
+
+        grid_cost       = float((grid_buy * grid.prices).sum())
+        export_revenue  = float((grid_sell * np.maximum(grid.prices, 0.0)).sum())
+        shortfall_mwh   = float(lp['cfe_excess'].sum())
+        grid_import_mwh = float(grid_buy.sum())
+        grid_sell_mwh   = float(grid_sell.sum())
+
+        tariff_cost = self.buy_tariff * grid_import_mwh + self.sell_tariff * grid_sell_mwh
+        total = onsite_cost + grid_cost - export_revenue + tariff_cost + self.grid_connect_annual
+
+        inv_cost = (
+            self.solar_tech.capex * self.solar_tech.crf * c_solar
+            + self.wind_tech.capex  * self.wind_tech.crf  * c_wind
+            + (self.battery.capex_power * batt_power + self.battery.capex_energy * batt_energy) * self.battery.crf
+            + self.gas_tech.capex * self.gas_tech.crf * c_gas
+        ) * sf
+        om_cost = (
+            self.solar_tech.opex_fixed * c_solar
+            + self.wind_tech.opex_fixed  * c_wind
+            + self.battery.opex_fixed   * batt_power
+            + self.gas_tech.opex_fixed  * c_gas
+        ) * sf + self.wind_tech.opex_var * float(c_wind * self.wind_cf.sum()) + gas_var_cost
+
+        return Result(
+            label                 = "VEGAS",
+            c_solar_mw            = c_solar,
+            c_wind_mw             = c_wind,
+            batt_power_mw         = batt_power,
+            batt_energy_mwh       = batt_energy,
+            c_gas_mw              = c_gas,
+            onsite_capacity_mw    = c_solar + c_wind + c_gas,
+            annual_onsite_cost    = onsite_cost,
+            annual_grid_cost      = grid_cost,
+            annual_export_revenue = export_revenue,
+            annual_total_cost     = total,
+            lcoe                  = total / self.demand.annual_mwh,
+            grid_import_mwh       = grid_import_mwh,
+            cfe_shortfall_mwh     = shortfall_mwh,
+            annual_tariff_cost    = tariff_cost,
+            annual_grid_connect   = self.grid_connect_annual,
+            annual_inv_cost       = inv_cost,
+            annual_om_cost        = om_cost,
         )
 
 

@@ -64,6 +64,27 @@ battery = Battery(
     eta_discharge  = 0.97,      # DC discharge efficiency  [DEA 2030]
 )
 
+# ── gas turbine CCGT (steam extraction) ──────────────────────────────────────
+# DEA Technology Data 2030, sheet "05 Gas turb. CC, steam extract."
+# Fuel: green gas at 100 DKK/GJ. Efficiency 58% (DEA 2030 annual average).
+# Gas tariff: 25 DKK/MWh_el.
+
+GAS_EFFICIENCY     = 0.58         # annual average electrical efficiency [DEA 2030]
+GAS_PRICE_DKK_GJ   = 100.0        # DKK/GJ green gas [ET]
+GAS_TARIFF_DKK_MWH = 25.0         # DKK/MWh_el [ET]
+
+# fuel cost per MWh_el: (100 DKK/GJ × 3.6 GJ/MWh) / 7.46 / 0.58
+_gas_fuel_eur_mwh_el = GAS_PRICE_DKK_GJ * 3.6 / DKK_EUR / GAS_EFFICIENCY   # ≈ 83.2 €/MWh_el
+_gas_tariff_eur_mwh  = GAS_TARIFF_DKK_MWH / DKK_EUR                        # ≈  3.4 €/MWh_el
+
+gas_tech = Tech(
+    capex         = 882_599,    # €/MW  [DEA 2030: 0.88259936 MEUR/MW_e]
+    opex_fixed    = 29_562,     # €/MW/yr  [DEA 2030]
+    opex_var      = 4.466 + _gas_fuel_eur_mwh_el + _gas_tariff_eur_mwh,  # €/MWh_el ≈ 91.1
+    lifetime      = 25,         # years  [DEA 2030]
+    discount_rate = DISCOUNT_RATE,
+)
+
 # ── demand ────────────────────────────────────────────────────────────────────
 
 demand = DatacenterDemand(demand_mw=1_000.0, x=0.50)
