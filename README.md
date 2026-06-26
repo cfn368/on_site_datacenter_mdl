@@ -2,7 +2,7 @@
 
 Developed by Linus Lindquist for [Erhvervslivets Tænketank](https://www.etank.dk) as part of Kernekraftprojektet.
 
-A 1 GW datacenter must source a legally mandated fraction of its load from on-site generation. The model compares two technologies on annualised cost: a small modular nuclear reactor (KK) that delivers constant output interrupted by a planned annual maintenance window, and a solar-wind-battery portfolio (VE) that dispatches optimally against hourly spot prices. The comparison is run across multiple years and on-site fractions.
+A 1 GW datacenter must source a legally mandated fraction of its load from on-site generation. The model compares three technologies on annualised cost: a small modular nuclear reactor (KK) that delivers constant output interrupted by a planned annual maintenance window; a solar-wind-battery portfolio (VE) that dispatches optimally against hourly spot prices; and a VE-plus-gas-turbine variant (VEGAS) where the gas plant fires during Dunkelflaute when VE and battery fall short. The comparison is run across multiple years and on-site fractions.
 
 ## Data sources
 
@@ -22,7 +22,7 @@ KK_datacentre/
 ├── lp_model.tex          # Full LP documentation: variables, objective, constraints, economic intuition
 │
 ├── pylib/
-│   ├── model.py          # Core model: DatacenterDemand, GridSupply, KKSupply, VESupply, DatacenterModel
+│   ├── model.py          # Core model: DatacenterDemand, GridSupply, KKSupply, VESupply, VEGasSupply, DatacenterModel
 │   ├── assumptions.py    # All cost and technical parameters — import from here, never hardcode
 │   ├── setup.py          # Notebook preamble: autoreload, AEJ style, standard imports + mdates
 │   └── ve_dispatch.py    # Dispatch detail, aggregation, and plotting
@@ -35,9 +35,10 @@ KK_datacentre/
 │
 ├── variation_patterns/   # 8760-row input files (one value per line, dot-decimal)
 ├── runs/
-│   ├── ve_solution.json  # Cached optimal capacities (c_solar, c_wind, batt_power, batt_energy)
-│   ├── ve_lp_arrays.npz  # Cached LP dispatch arrays (binary)
-│   └── lp_arrays/        # All key model time series as plain-text txt files (one value per line):
+│   ├── ve_solution.json      # Cached VE optimal capacities (c_solar, c_wind, batt_power, batt_energy)
+│   ├── ve_lp_arrays.npz      # Cached VE LP dispatch arrays (binary)
+│   ├── vegas_lp_arrays.npz   # Cached VEGAS LP capacities + MILP dispatch arrays (binary)
+│   └── lp_arrays/            # All key VE model time series as plain-text txt files (one value per line):
 │                         # charge, discharge, soc, grid_buy, grid_sell, curtail, curtail_pv,
 │                         # curtail_wl, cfe_excess, pv_gen, wl_gen
 └── figures/              # Output figures
@@ -65,6 +66,14 @@ Additional fixed costs: solar land rent (4,800 €/MW/yr), grid connection fee (
 
 At low `x` the VE optimum involves a large solar overbuild that generates substantial export revenue, making VE cheaper than KK. At high `x` the on-site floor tightens, the export cap shrinks, and KK's stable output becomes the cheaper option.
 
+Solar land use: 10 ha/MW (100 km²/GW), at a land rent of 3,581 DKK/ha/yr ≈ 4,800 €/MW/yr. The `max_solar_mw` constructor parameter caps installed solar capacity, enabling area-constraint sensitivity analysis.
+
+### VEGAS
+
+VEGAS adds a gas turbine (CCGT, green gas) as a fourth on-site technology alongside VE's solar, wind, and battery. The gas plant is last in the merit order at roughly 115 €/MWh variable cost (green gas at 100 DKK/GJ, 45% effective efficiency including startup losses, plus a 25 DKK/MWh tariff). It fires only during Dunkelflaute — winter periods when VE and battery combined cannot meet the hourly CFE floor.
+
+The solve is two-stage. First, a single LP jointly optimises all five capacities (solar, wind, battery power, battery energy, gas) and the full 8,760-hour dispatch. This gives the optimal gas turbine size `c_gas*`. Second, a MILP re-solves dispatch with `c_gas*` fixed and binary on/off variables added for each hour, enforcing a 40% minimum stable load: the gas turbine either runs at ≥ 40% of rated capacity or not at all. Fixing `c_gas*` between stages keeps the MILP constraints linear. Both solves use HiGHS (via `scipy.optimize.linprog` and `scipy.optimize.milp` respectively).
+
 ## How to run
 
 All notebooks open with:
@@ -77,7 +86,7 @@ setup_notebook()
 Run in order:
 
 1. `1_input.ipynb` — fetches variation patterns from Energi Data Service and writes them to `variation_patterns/`. Requires internet access and the `ET-eds-api` package.
-2. `2_model.ipynb` — loads inputs, runs the single LP, prints the KK vs VE comparison, and saves the VE solution to `runs/`. Solves in seconds.
+2. `2_model.ipynb` — loads inputs, runs KK, VE (LP), and VEGAS (LP + MILP), prints the three-way cost comparison, and saves solutions to `runs/`. VE solves in seconds; VEGAS adds ~1–2 minutes for the MILP dispatch stage.
 3. `3_time_series.ipynb` — loads the cached solution and produces dispatch and battery figures for VE, the KK hourly profile showing the planned outage window, and a weekly curtailment plot split by wind and solar.
 4. `4_cases.ipynb` — runs both models across years (2022–2025) and on-site fractions (25/50/75 %) and prints the results table.
 

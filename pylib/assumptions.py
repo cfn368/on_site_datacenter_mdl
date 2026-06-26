@@ -33,9 +33,14 @@ SMR_DOWNTIME = 0.10   # planned maintenance fraction of year (one contiguous blo
 
 # ── solar PV (utility-scale) ──────────────────────────────────────────────────
 
+SOLAR_LAND_HA_PER_MW   = 10.0    # ha/MW total site area  [DEA 2030]
+SOLAR_LAND_RENT_DKK_HA = 3_581   # DKK/ha/yr  [ET] — gives 4,800 €/MW/yr at 10 ha/MW
+
+_solar_land_eur_mw_yr = SOLAR_LAND_HA_PER_MW * SOLAR_LAND_RENT_DKK_HA / DKK_EUR  # ≈ 4,800
+
 solar_tech = Tech(
     capex         = 450_000,   # €/MW  [DEA 2030]
-    opex_fixed    = 15_200,    # €/MW/yr  [DEA 2030: 10,400 + 4,800 land rent]
+    opex_fixed    = 10_400 + _solar_land_eur_mw_yr,  # €/MW/yr  [DEA 2030: 10,400 + land rent ≈ 15,200]
     opex_var      = 0,         # €/MWh
     lifetime      = 40,        # years
     discount_rate = DISCOUNT_RATE,
@@ -69,9 +74,10 @@ battery = Battery(
 # Fuel: green gas at 100 DKK/GJ. Efficiency 58% (DEA 2030 annual average).
 # Gas tariff: 25 DKK/MWh_el.
 
-GAS_EFFICIENCY     = 0.58         # annual average electrical efficiency [DEA 2030]
+GAS_EFFICIENCY     = 0.45         # effective efficiency incl. startup losses [ET, DEA 2030 = 0.58]
 GAS_PRICE_DKK_GJ   = 100.0        # DKK/GJ green gas [ET]
 GAS_TARIFF_DKK_MWH = 25.0         # DKK/MWh_el [ET]
+GAS_MIN_LOAD       = 0.40         # minimum stable load fraction [DEA 2030]
 
 # fuel cost per MWh_el: (100 DKK/GJ × 3.6 GJ/MWh) / 7.46 / 0.58
 _gas_fuel_eur_mwh_el = GAS_PRICE_DKK_GJ * 3.6 / DKK_EUR / GAS_EFFICIENCY   # ≈ 83.2 €/MWh_el

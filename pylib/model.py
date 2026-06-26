@@ -272,6 +272,7 @@ class VESupply:
         bisect_upper_energy: float = 1_000_000.0,   # MWh — ceiling for inner bisection
         tol_energy:          float = 1.0,           # MWh — inner bisection tolerance
         tol_ve:              float = 1.0,           # MW  — outer Nelder-Mead tolerance
+        max_solar_mw:        float | None = None,   # upper bound on c_solar (e.g. area cap)
     ):
         if len(solar_cf) != demand.HOURS or len(wind_cf) != demand.HOURS:
             raise ValueError(f"Capacity factor arrays must match demand.HOURS ({demand.HOURS})")
@@ -292,6 +293,7 @@ class VESupply:
         self.bisect_upper_energy = bisect_upper_energy
         self.tol_energy          = tol_energy
         self.tol_ve              = tol_ve
+        self.max_solar_mw        = max_solar_mw
         self._solution: tuple[float, float, float, float] | None = None  # (c_solar, c_wind, batt_power, batt_energy)
         self._lp_cache: dict | None = None
 
@@ -524,8 +526,12 @@ class VESupply:
 
         # ── bounds ────────────────────────────────────────────────────────────
 
+        cap_bounds = (
+            [(0.0, self.max_solar_mw)]   # c_solar (may be area-capped)
+            + [(0.0, None)] * (N_cap - 1)
+        )
         bounds = (
-            [(0.0, None)] * N_cap        # capacity variables ≥ 0
+            cap_bounds
             + [(0.0, None)] * (3 * T)    # charge, discharge, soc (upper via inequality)
             + [(0.0, d)]    * T          # grid_buy ≤ demand_mw
             + [(0.0, g)]    * T          # grid_sell ≤ grid_cap_mw
@@ -855,6 +861,8 @@ class VEGasSupply:
         sell_tariff:         float = 0.0,
         grid_connect_annual: float = 0.0,
         cfe_penalty:         float = 1e6,
+        min_load:            float = 0.0,   # minimum stable load fraction; triggers MILP dispatch when > 0
+        max_solar_mw:        float | None = None,   # upper bound on c_solar (e.g. area cap)
     ):
         if len(solar_cf) != demand.HOURS or len(wind_cf) != demand.HOURS:
             raise ValueError(f"CF arrays must match demand.HOURS ({demand.HOURS})")
@@ -873,6 +881,8 @@ class VEGasSupply:
         self.sell_tariff         = sell_tariff
         self.grid_connect_annual = grid_connect_annual
         self.cfe_penalty         = cfe_penalty
+        self.min_load            = min_load
+        self.max_solar_mw        = max_solar_mw
         self._lp_cache: dict | None = None
 
     def _single_lp(self) -> dict | None:
@@ -967,7 +977,8 @@ class VEGasSupply:
         b_ub = np.concatenate([np.full(T, g), np.zeros(6 * T)])
 
         bounds = (
-            [(0.0, None)] * N_cap
+            [(0.0, self.max_solar_mw)]   # c_solar (may be area-capped)
+            + [(0.0, None)] * (N_cap - 1)
             + [(0.0, None)] * (3 * T)   # charge, discharge, soc
             + [(0.0, d)]    * T         # gas_gen (loose; tight via gas capacity constraint)
             + [(0.0, d)]    * T         # grid_buy ≤ demand_mw
@@ -1010,10 +1021,106 @@ class VEGasSupply:
             'wl_gen':      c_w * self.wind_cf,
         }
 
+    def _dispatch_milp(self, c_solar: float, c_wind: float,
+                       batt_power: float, batt_energy: float, c_gas: float) -> dict:
+        """
+        MILP dispatch with minimum-load constraint, given fixed capacities from the LP.
+
+        Adds T binary on[t] variables. Constraint: gas_gen[t] ∈ {0} ∪ [min_load*c_gas, c_gas].
+        Linearised as: gas_gen ≤ c_gas*on  AND  gas_gen ≥ min_load*c_gas*on.
+        (c_gas is a scalar here so both constraints are linear in on[t] and gas_gen[t].)
+
+        Variable layout (10T): on charge discharge soc gas_gen grid_buy grid_sell
+                                curtail_pv curtail_wl cfe_excess
+        """
+        from scipy.sparse import eye as speye, diags, hstack, vstack, csr_matrix
+        from scipy.optimize import milp, LinearConstraint, Bounds
+
+        T     = self.demand.HOURS
+        d     = self.demand.demand_mw
+        g     = self.demand.grid_cap_mw
+        p     = self.prices
+        M     = self.cfe_penalty
+        eta_c = self.battery.eta_charge
+        eta_d = self.battery.eta_discharge
+
+        pv_gen = c_solar * self.solar_cf
+        wl_gen = c_wind  * self.wind_cf
+
+        I = speye(T, format='csr')
+        Z = csr_matrix((T, T))
+        L = (diags([np.ones(T), -np.ones(T - 1)], [0, -1], shape=(T, T), format='csr')
+             + csr_matrix(([-1.0], ([0], [T - 1])), shape=(T, T)))
+
+        c_obj = np.concatenate([
+            np.zeros(T),                              # on
+            np.zeros(3 * T),                          # charge, discharge, soc
+            np.full(T, self.gas_tech.opex_var),       # gas_gen
+            p + self.buy_tariff,                      # grid_buy
+            -p + self.sell_tariff,                    # grid_sell
+            np.zeros(T),                              # curtail_pv
+            np.full(T, -self.wind_tech.opex_var),     # curtail_wl
+            np.full(T, M),                            # cfe_excess
+        ])
+
+        lb = np.zeros(10 * T)
+        ub = np.empty(10 * T)
+        ub[0*T:1*T] = 1.0;         ub[1*T:2*T] = batt_power
+        ub[2*T:3*T] = batt_power;  ub[3*T:4*T] = batt_energy
+        ub[4*T:5*T] = c_gas;       ub[5*T:6*T] = d
+        ub[6*T:7*T] = g;           ub[7*T:8*T] = pv_gen
+        ub[8*T:9*T] = wl_gen;      ub[9*T:]    = np.inf
+
+        integrality = np.zeros(10 * T); integrality[:T] = 1   # on[t] binary
+
+        # Energy balance (T, equality)
+        A_bal    = hstack([Z, I, -I, Z, -I, -I, I, I, I, Z], format='csr')
+        rhs_bal  = -d + pv_gen + wl_gen
+        # SOC recurrence (T, equality)
+        A_soc    = hstack([Z, -eta_c * I, (1.0 / eta_d) * I, L, Z, Z, Z, Z, Z, Z], format='csr')
+        # CFE (T, ≤ g)
+        A_cfe    = hstack([Z, Z, Z, Z, Z, I, Z, Z, Z, -I], format='csr')
+        # Gas on/off upper (T, ≤ 0): gas_gen ≤ c_gas*on
+        A_gas_up = hstack([-c_gas * I, Z, Z, Z, I, Z, Z, Z, Z, Z], format='csr')
+        # Gas min load (T, ≤ 0): gas_gen ≥ min_load*c_gas*on
+        A_gas_lo = hstack([self.min_load * c_gas * I, Z, Z, Z, -I, Z, Z, Z, Z, Z], format='csr')
+
+        A      = vstack([A_bal, A_soc, A_cfe, A_gas_up, A_gas_lo], format='csr')
+        lb_con = np.concatenate([rhs_bal, np.zeros(T), np.full(3 * T, -np.inf)])
+        ub_con = np.concatenate([rhs_bal, np.zeros(T),
+                                 np.full(T, g), np.zeros(T), np.zeros(T)])
+
+        res = milp(c_obj, constraints=LinearConstraint(A, lb_con, ub_con),
+                   integrality=integrality, bounds=Bounds(lb, ub))
+        if res.status != 0:
+            raise RuntimeError(f"MILP dispatch failed (status {res.status}): {res.message}")
+
+        x = res.x
+        return {
+            'on':         x[0*T:1*T],
+            'charge':     x[1*T:2*T],
+            'discharge':  x[2*T:3*T],
+            'soc':        x[3*T:4*T],
+            'gas_gen':    x[4*T:5*T],
+            'grid_buy':   x[5*T:6*T],
+            'grid_sell':  x[6*T:7*T],
+            'curtail_pv': x[7*T:8*T],
+            'curtail_wl': x[8*T:9*T],
+            'curtail':    x[7*T:8*T] + x[8*T:9*T],
+            'cfe_excess': x[9*T:10*T],
+            'milp_obj':   float(res.fun),
+        }
+
     def lp_detail(self) -> dict | None:
-        """All LP arrays for the optimised solution. None if LP not yet solved."""
+        """Capacities from LP; if min_load > 0, dispatch is resolved as MILP."""
         if self._lp_cache is None:
-            self._lp_cache = self._single_lp()
+            lp = self._single_lp()
+            if lp is not None and self.min_load > 0:
+                milp_disp = self._dispatch_milp(
+                    lp['c_solar'], lp['c_wind'], lp['batt_power'], lp['batt_energy'], lp['c_gas']
+                )
+                lp.update(milp_disp)   # overwrites dispatch arrays; keeps LP capacities
+            self._lp_cache = lp
         return self._lp_cache
 
     @property
@@ -1030,7 +1137,7 @@ class VEGasSupply:
         p = pathlib.Path(path)
         p.parent.mkdir(exist_ok=True)
         save_keys = ['c_solar', 'c_wind', 'batt_power', 'batt_energy', 'c_gas',
-                     'charge', 'discharge', 'soc', 'gas_gen',
+                     'charge', 'discharge', 'soc', 'gas_gen', 'on',
                      'grid_buy', 'grid_sell',
                      'curtail', 'curtail_pv', 'curtail_wl', 'cfe_excess', 'pv_gen', 'wl_gen']
         np.savez(str(p), **{k: lp[k] for k in save_keys if k in lp})
