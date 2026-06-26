@@ -1,51 +1,32 @@
-\documentclass[11pt]{article}
+\documentclass[10.5pt]{article}
 
-% ── encoding and font ─────────────────────────────────────────────────────────
 \usepackage[utf8]{inputenc}
 \usepackage[T1]{fontenc}
 \usepackage[sc]{mathpazo}
-\linespread{1.05}
+\linespread{1.04}
 \usepackage{microtype}
-
-% ── mathematics ───────────────────────────────────────────────────────────────
 \usepackage{amsmath,amssymb}
-
-% ── tables ────────────────────────────────────────────────────────────────────
 \usepackage{multirow,booktabs,tabularx}
-
-% ── layout ────────────────────────────────────────────────────────────────────
-\usepackage[margin=1in]{geometry}
+\usepackage[margin=0.9in]{geometry}
 \usepackage{enumitem}
 \setlength{\parindent}{0pt}
-\setlength{\parskip}{8pt plus 2pt minus 1pt}
-
-% ── colours and links ─────────────────────────────────────────────────────────
+\setlength{\parskip}{5pt plus 1pt minus 1pt}
 \usepackage{xcolor}
 \definecolor{MyIndigo}{HTML}{2F3A8F}
-\usepackage[
-    colorlinks = true,
-    linkcolor  = MyIndigo,
-    citecolor  = MyIndigo,
-    urlcolor   = MyIndigo,
-]{hyperref}
+\usepackage[colorlinks=true,linkcolor=MyIndigo,citecolor=MyIndigo,urlcolor=MyIndigo]{hyperref}
 
 \begin{document}
-
 \thispagestyle{empty}
 
 \begin{minipage}[c]{0.48\textwidth}
-  \centering
-  {\LARGE\bf Datacenter LP, \textit{notes}}\\
-  \vspace{2mm}
-  {\large \textit{KK vs.\ VE},}
-  Linus Lindquist
+  {\LARGE\bf Datacenter power sourcing, \textit{notes}}\\[2pt]
+  {\large \textit{KK vs.\ VE vs.\ VEGAS},} Linus Lindquist
 \end{minipage}
 \hfill
 \begin{minipage}[c]{0.48\textwidth}
-  \textit{\textbf{Goal.} Document the LP model used to find the least-cost
-  solar--wind--battery mix for a 1\,GW datacenter subject to an hourly
-  clean-energy constraint. Covers variables, objective, constraints, economic
-  intuition, and the solver.}
+  \textit{\textbf{Goal.} Document the LP/MILP models used to find the least-cost
+  on-site power mix for a 1\,GW datacenter. Covers KK (nuclear), VE
+  (solar--wind--battery), and VEGAS (VE + gas turbine).}
 \end{minipage}
 
 \rule{\textwidth}{0.8pt}
@@ -53,504 +34,260 @@
 % ─────────────────────────────────────────────────────────────────────────────
 \subsection*{Problem setting}
 
-A datacenter draws a \textit{flat} $P = 1{,}000$\,MW around the clock, every
-hour of the year ($T = 8{,}760$ hours). Danish regulation requires that a
-fraction $x \in (0,1)$ of this demand be sourced \textit{on-site} in each
-individual hour; the remainder may be imported from the Nordic spot market at an
-exogenous hourly price $p_t$ (DKK/MWh, converted to EUR at $7.46$). This
-hourly on-site requirement is referred to throughout as the
-\textbf{Carbon-Free Energy (CFE)} constraint: in every hour $t$, grid purchases
-$g^+_t$ may not exceed the grid cap $\bar{g} = (1-x)\cdot P$.
+A datacenter draws a flat $P = 1{,}000$\,MW at all $T = 8{,}760$ hours/yr.
+Regulation requires that fraction $x \in (0,1)$ of demand be sourced
+\emph{on-site} each hour; the rest may be imported at an exogenous hourly spot
+price $p_t$ (DKK/MWh~$\div$~7.46 = €/MWh). This is the \textbf{CFE
+constraint}: grid purchases $g^+_t \leq \bar{g} = (1-x)\cdot P$ every hour.
+Three on-site options are compared on \textbf{total annualised cost}:
 
-The model compares two on-site technologies on \textbf{total annualised cost}:
-\begin{itemize}[noitemsep]
-  \item \textbf{KK} — a 1\,GW SMR running flat with a single planned outage of
-        $10\%$ of the year.
-  \item \textbf{VE} — jointly optimised solar PV, onshore wind, and a
-        lithium-ion BESS.
+\begin{itemize}[noitemsep,topsep=2pt]
+  \item \textbf{KK} — 1\,GW SMR, constant output, one planned outage of $10\%$
+        of the year placed optimally in the price series.
+  \item \textbf{VE} — jointly optimised solar PV, onshore wind, and BESS.
+        Single LP over capacities and all 8{,}760-h dispatch simultaneously.
+  \item \textbf{VEGAS} — VE + gas turbine (CCGT, green gas). Gas is last in
+        the merit order. Two-stage solve: LP for capacities, MILP for dispatch
+        with a 40\,\% minimum-load constraint.
 \end{itemize}
-
-This document focuses on the VE case, which is formulated as a single linear
-programme solved by HiGHS.
 
 % ─────────────────────────────────────────────────────────────────────────────
 \subsection*{Assumptions}
 
-All cost and technical parameters are sourced from the Danish Energy Agency
-Technology Data (DEA, 2030-projection column) and internal ET estimates.
-Costs are in EUR; DKK figures converted at $7.46$\,DKK/€.
-The capital recovery factor is $\text{CRF}(r,n) = r(1+r)^n/[(1+r)^n-1]$
-at $r = 4\%$.
-
-\medskip
-
-{\small
+{\footnotesize
 \begin{tabularx}{\linewidth}{l >{\raggedright\arraybackslash}X r l l}
 \toprule
 Technology & Parameter & Value & Unit & Source \\
 \midrule
-\multirow{3}{*}{Common}
-  & Discount rate $r$       &   4.00 & \%         & ET \\
-  & Exchange rate           &   7.46 & DKK/€      & ET \\
-  & Demand $P$              & 1{,}000 & MW        & — \\
+\multirow{2}{*}{Common}
+  & Discount rate $r$     &  4.00 & \%      & ET \\
+  & Exchange rate         &  7.46 & DKK/€   & ET \\
 \midrule
-\multirow{6}{*}{SMR (KK)}
-  & Capex                   & 8{,}000 & k€/MW     & ET \\
-  & Fixed O\&M              &       0 & €/MW/yr   & ET \\
-  & Variable O\&M (total)   &   31.08 & €/MWh     & ET \\
-  & \quad of which: fuel    &    9.32 & €/MWh     & ET \\
-  & \quad of which: O\&M    &   20.42 & €/MWh     & ET \\
-  & \quad of which: surcharge&   1.34 & €/MWh     & ET \\
-  & Lifetime                &      60 & yr        & FOA \\
-  & Planned downtime $\delta$&     10 & \%        & ET \\
-  & CRF$(4\%,\,60)$         &    4.42 & \%        & derived \\
+\multirow{5}{*}{SMR (KK)}
+  & Capex                 & 8{,}000 & k€/MW & ET \\
+  & Fixed O\&M            &       0 & €/MW/yr & ET \\
+  & Variable O\&M (total) &  31.08 & €/MWh  & ET \\
+  & Lifetime              &     60 & yr     & FOA \\
+  & Planned downtime      &     10 & \%     & ET \\
 \midrule
-\multirow{5}{*}{Solar PV}
-  & Capex                   &     450 & k€/MW     & DEA 2030 \\
-  & Fixed O\&M (total)      &  15{,}200 & €/MW/yr & DEA 2030 + ET \\
-  & \quad of which: DEA O\&M&  10{,}400 & €/MW/yr & DEA 2030 \\
-  & \quad of which: land rent&  4{,}800 & €/MW/yr & ET \\
-  & Variable O\&M           &       0 & €/MWh     & DEA 2030 \\
-  & Lifetime                &      40 & yr        & DEA 2030 \\
-  & CRF$(4\%,\,40)$         &    5.05 & \%        & derived \\
+\multirow{4}{*}{Solar PV}
+  & Capex                 &    450 & k€/MW  & DEA 2030 \\
+  & Fixed O\&M (DEA + land rent) & 15{,}200 & €/MW/yr & DEA 2030 + ET \\
+  & Land density          &     10 & ha/MW (100\,km²/GW) & ET \\
+  & Lifetime              &     40 & yr     & DEA 2030 \\
 \midrule
-\multirow{5}{*}{Wind (onshore)}
-  & Capex                   &  1{,}150 & k€/MW    & DEA 2030 \\
-  & Fixed O\&M              &  16{,}663 & €/MW/yr & DEA 2030 \\
-  & Variable O\&M $\eta$    &    1.98 & €/MWh     & DEA 2030 \\
-  & Lifetime                &      30 & yr        & DEA 2030 \\
-  & CRF$(4\%,\,30)$         &    5.78 & \%        & derived \\
+\multirow{4}{*}{Wind (onshore)}
+  & Capex                 & 1{,}150 & k€/MW & DEA 2030 \\
+  & Fixed O\&M            & 16{,}663 & €/MW/yr & DEA 2030 \\
+  & Variable O\&M $\eta$  &   1.98 & €/MWh  & DEA 2030 \\
+  & Lifetime              &     30 & yr     & DEA 2030 \\
 \midrule
-\multirow{8}{*}{Battery (BESS)}
-  & Power capex             &      80 & k€/MW     & DEA 2030 \\
-  & Energy capex            &     200 & k€/MWh    & DEA 2030 \\
-  & Fixed O\&M (on power)   &   8{,}100 & €/MW/yr & DEA 2030 \\
-  & Lifetime                &      20 & yr        & DEA 2030 \\
-  & Duration sh             &       4 & h         & assumed \\
-  & CRF$(4\%,\,20)$         &    7.36 & \%        & derived \\
-  & Charge efficiency $\eta_c$ &   98 & \%        & DEA 2030 \\
-  & Discharge efficiency $\eta_d$ & 97 & \%       & DEA 2030 \\
+\multirow{5}{*}{Battery}
+  & Power capex           &     80 & k€/MW  & DEA 2030 \\
+  & Energy capex          &    200 & k€/MWh & DEA 2030 \\
+  & Fixed O\&M (on power) &  8{,}100 & €/MW/yr & DEA 2030 \\
+  & Duration sh (default) &      4 & h      & assumed \\
+  & Charge / discharge $\eta_c / \eta_d$ & 0.98\,/\,0.97 & — & DEA 2030 \\
 \midrule
-\multirow{4}{*}{Grid tariffs}
-  & Buy tariff $\tau^+$     &   11.66 & €/MWh     & Energinet \\
-  & \quad (= 8.70\,øre/kWh) &        &            & \\
-  & Sell tariff $\tau^-$    &    1.54 & €/MWh     & Energinet \\
-  & \quad (= 1.15\,øre/kWh) &        &            & \\
+\multirow{5}{*}{Gas turbine}
+  & Capex                 &    883 & k€/MW  & DEA 2030 \\
+  & Fixed O\&M            & 29{,}562 & €/MW/yr & DEA 2030 \\
+  & Variable O\&M (total) &   $\approx$115 & €/MWh & ET \\
+  & Efficiency (effective) &    45 & \%     & ET (DEA = 58\,\%) \\
+  & Minimum stable load   &    40 & \%     & DEA 2030 \\
+  & Lifetime              &     25 & yr     & DEA 2030 \\
 \midrule
-\multirow{3}{*}{Grid connection}
-  & Fixed component         &   18.20 & M\,DKK    & ET \\
-  & Variable component      &    0.663 & M\,DKK/MW & ET \\
-  & Annualisation           & perpetuity at $r=4\%$ && ET \\
+\multirow{2}{*}{Grid tariffs}
+  & Buy $\tau^+$ (8.70\,øre/kWh) & 11.66 & €/MWh & Energinet \\
+  & Sell $\tau^-$ (1.15\,øre/kWh) &  1.54 & €/MWh & Energinet \\
+\midrule
+Grid connection & 18.2\,M\,DKK fixed + 0.663\,M\,DKK/MW, perpetuity at $r=4\%$ &&& ET \\
 \bottomrule
 \end{tabularx}}
 
-\medskip
-\textit{Note on SMR variable O\&M:} the fuel cost ($9.32$\,€/MWh) already
-accounts for thermal efficiency, i.e.\ it is expressed per MWh of electrical
-output. The ET surcharge ($1.34$\,€/MWh $\approx 1$\,øre/kWh) is an
-additional policy cost applied on top of DEA estimates.
+\smallskip
+\textit{SMR variable O\&M (31.08\,€/MWh) = fuel 9.32 + O\&M 20.42 + ET surcharge 1.34, all per
+MWh\textsubscript{el}.
+Gas effective efficiency 45\,\% captures startup fuel losses; DEA annual-average is 58\,\%.
+Green gas price 100\,DKK/GJ; gas tariff 25\,DKK/MWh\textsubscript{el}.}
 
 % ─────────────────────────────────────────────────────────────────────────────
 \subsection*{Notation}
 
-{\small
-\begin{tabularx}{\linewidth}{l l >{\raggedright\arraybackslash}X}
+{\footnotesize
+\begin{tabularx}{\linewidth}{l l >{\raggedright\arraybackslash}X l l >{\raggedright\arraybackslash}X}
 \toprule
-Symbol & Unit & Meaning \\
+Symbol & Unit & Meaning & Symbol & Unit & Meaning \\
 \midrule
-$c_s,\,c_w$ & MW & installed solar / wind capacity \\
-$P_b,\,E_b$ & MW, MWh & battery power and energy capacity \\
-$u_t,\,d_t$ & MW & battery charge / discharge at hour $t$ \\
-$s_t$ & MWh & battery state of charge (end of hour $t$) \\
-$g^+_t,\,g^-_t$ & MW & grid buy / sell at hour $t$ \\
-$q^s_t,\,q^w_t$ & MW & solar / wind curtailment at hour $t$ \\
-$e_t$ & MW & CFE excess slack (penalised) \\
-$\bar{g}$ & MW & maximum grid import/export: $(1-x)\cdot P$ \\
-$\text{CF}^s_t,\,\text{CF}^w_t$ & — & solar / wind capacity factor at hour $t$ \\
-$p_t$ & €/MWh & spot price at hour $t$ \\
-$\tau^+,\,\tau^-$ & €/MWh & grid buy / sell tariff ($11.66$ / $1.54$) \\
-$\eta$ & €/MWh & wind variable O\&M ($1.98$) \\
-$\eta_c,\,\eta_d$ & — & DC charge / discharge efficiency ($0.98$ / $0.97$) \\
-$M$ & €/MWh & CFE penalty ($10^6$) \\
+$c_s,c_w,c_g$ & MW & solar / wind / gas capacity &
+  $g^+_t, g^-_t$ & MW & grid buy / sell \\
+$P_b, E_b$ & MW, MWh & battery power / energy &
+  $q^s_t, q^w_t$ & MW & solar / wind curtailment \\
+$u_t, d_t$ & MW & battery charge / discharge &
+  $e_t$ & MW & CFE slack (penalised) \\
+$s_t$ & MWh & battery SOC end of hour $t$ &
+  $z_t$ & MW & gas generation \\
+$o_t \in \{0,1\}$ & — & gas on/off (MILP only) &
+  $M$ & €/MWh & CFE penalty ($10^6$) \\
 \bottomrule
 \end{tabularx}}
 
 % ─────────────────────────────────────────────────────────────────────────────
-\subsection*{Decision variables}
+\subsection*{VE — single LP}
 
-The LP has $3 + 8T \approx 70{,}083$ decision variables (with $\text{sh} = 4$
-fixed; setting $\text{sh} = \texttt{None}$ adds $E_b$ as a fourth free capacity
-variable):
+\textbf{Variables.} $3 + 8T \approx 70{,}083$ decision variables (sh\,=\,4 fixed;
+setting sh\,=\,\texttt{None} adds $E_b$ as a fourth free capacity variable):
+$c_s,\,c_w,\,P_b$ (capacities) plus eight blocks of $T$ dispatch variables.
+All continuous and non-negative.
 
-\medskip
-{\small
-\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}X l}
-\toprule
-Block & Size \\
-\midrule
-Capacity: $c_s,\,c_w,\,P_b$ (with $E_b = 4P_b$) & 3 scalars \\
-Battery charge $u_t$ & $T$ \\
-Battery discharge $d_t$ & $T$ \\
-Battery SOC $s_t$ & $T$ \\
-Grid buy $g^+_t$ & $T$ \\
-Grid sell $g^-_t$ & $T$ \\
-Solar curtailment $q^s_t$ & $T$ \\
-Wind curtailment $q^w_t$ & $T$ \\
-CFE excess $e_t$ & $T$ \\
-\bottomrule
-\end{tabularx}}
+\textbf{Objective.}
 
-\medskip
-All variables are continuous and non-negative. The capacity variables are shared
-across all hours — the LP simultaneously decides \textit{how much} to build and
-\textit{how to dispatch} each asset in every hour of the year in a single solve.
-This is the key advantage over a two-stage Nelder-Mead outer / LP inner
-approach: no iteration is needed.
+\begin{equation}
+\min \;
+  \alpha_s c_s + \alpha_w c_w + \beta_P P_b + \beta_E E_b
+  + \sum_{t=1}^{T}
+  \!\Bigl[
+    (p_t + \tau^+)\,g^+_t
+    - (p_t - \tau^-)\,g^-_t
+    - \eta\,q^w_t
+    + M\,e_t
+  \Bigr]
+\label{eq:ve_obj}
+\end{equation}
 
-% ─────────────────────────────────────────────────────────────────────────────
-\subsection*{Objective function}
+Annualised capacity cost coefficients ($\text{CRF}(r,n)=r(1+r)^n/[(1+r)^n-1]$, $r=4\%$):
+$\alpha_s = \text{capex}_s\cdot\text{CRF}_s + \text{opex}^f_s$;\;
+$\alpha_w = \text{capex}_w\cdot\text{CRF}_w + \text{opex}^f_w + \eta\sum_t\text{CF}^w_t$;\;
+$\beta_P = \text{capex}^P_b\cdot\text{CRF}_b + \text{opex}^f_b$;\;
+$\beta_E = \text{capex}^E_b\cdot\text{CRF}_b$.
 
-The LP minimises the total annual cost:
+$\alpha_w$ charges wind O\&M on gross generation; $-\eta\,q^w_t$ credits back curtailed
+hours, so only dispatched MWh pay the 1.98\,€/MWh. Solar O\&M is zero, so the LP
+always curtails wind before solar.
+
+\textbf{Constraints.}
 
 \begin{align}
-\min \quad &
-  \underbrace{\alpha_s c_s + \alpha_w c_w}_{\text{solar and wind capex + O\&M}}
-  +\; \underbrace{\beta_P P_b + \beta_E E_b}_{\text{battery capex + O\&M}}
-  \notag \\[4pt]
-&  + \sum_{t=1}^{T}
-  \Bigl[
-    \underbrace{(p_t + \tau^+)\,g^+_t}_{\text{grid purchase cost}}
-    - \underbrace{(p_t - \tau^-)\,g^-_t}_{\text{grid revenue}}
-    - \underbrace{\eta\,q^w_t}_{\text{wind O\&M saved}}
-    + \underbrace{M\,e_t}_{\text{CFE penalty}}
-  \Bigr]
-\label{eq:obj}
+  c_s\,\text{CF}^s_t + c_w\,\text{CF}^w_t
+    + d_t - u_t + g^+_t - g^-_t - q^s_t - q^w_t &= P
+  && \forall\,t \quad\text{(energy balance)} \label{eq:bal}\\[2pt]
+  s_t - s_{t-1} &= \eta_c\,u_t - d_t/\eta_d
+  && \forall\,t \quad\text{(SOC recurrence)} \label{eq:soc}\\[2pt]
+  g^+_t - e_t &\leq \bar{g}
+  && \forall\,t \quad\text{(CFE cap)} \label{eq:cfe}\\[2pt]
+  u_t \leq P_b,\;\; d_t \leq P_b,\;\; s_t &\leq E_b
+  && \forall\,t \quad\text{(battery limits)} \label{eq:batt}\\[2pt]
+  q^s_t \leq c_s\,\text{CF}^s_t,\;\; q^w_t &\leq c_w\,\text{CF}^w_t
+  && \forall\,t \quad\text{(curtailment limits)} \label{eq:curt}\\[2pt]
+  g^-_t &\leq \bar{g}
+  && \forall\,t \quad\text{(export cap)}
 \end{align}
 
-\textbf{Capacity cost coefficients.} Each coefficient annualises capital and
-fixed operating costs using the capital recovery factor
-$\text{CRF}(r,n) = r(1+r)^n / [(1+r)^n - 1]$ at discount rate $r = 4\%$:
+\textbf{Cyclic SOC.} The L matrix in \eqref{eq:soc} has $L_{0,T-1}=-1$, making the
+implicit prior SOC at $t=0$ equal to $s_{T-1}$: the battery closes the year at the same
+charge level it started, with no net energy accumulation.
 
-\begin{align*}
-\alpha_s &= \text{capex}_s \cdot \text{CRF}_s + \text{opex}^f_s
-            + \underbrace{0}_{\eta^s=0} \cdot \textstyle\sum_t \text{CF}^s_t \\
-\alpha_w &= \text{capex}_w \cdot \text{CRF}_w + \text{opex}^f_w
-            + \eta \cdot \textstyle\sum_t \text{CF}^w_t \\
-\beta_P  &= \text{capex}^P_b \cdot \text{CRF}_b + \text{opex}^f_b \\
-\beta_E  &= \text{capex}^E_b \cdot \text{CRF}_b
-\end{align*}
+\textbf{LP feasibility.} The box bound is $g^+_t \leq P$ (not $\bar{g}$); the CFE slack
+$e_t$ absorbs violations at penalty $M=10^6$\,€/MWh, ensuring the LP is always feasible
+during the simultaneous capacity-and-dispatch solve. At the optimum $e_t=0$.
 
-Note that $\alpha_w$ charges wind variable O\&M on \textit{all potential}
-generation ($c_w \cdot \sum_t \text{CF}^w_t$). The term $-\eta\, q^w_t$ then
-credits back the O\&M that would have been paid on curtailed wind, so the net
-effect is that only \textit{dispatched} wind MWh carry the 1.98\,€/MWh charge.
-Solar has no variable O\&M ($\eta^s = 0$), so curtailing solar saves nothing
-and $q^s_t$ has zero cost in the objective.
+\textbf{Area cap.} Optional parameter \texttt{max\_solar\_mw} adds the bound
+$c_s \leq \overline{c}_s$ directly in the LP, enabling sensitivity analysis on solar
+land availability (100\,km²/GW at 10\,ha/MW).
 
-\textbf{Economic implication.} Because $q^w_t$ enters the objective with a
-negative coefficient $-\eta < 0$, the LP has a genuine economic incentive to
-curtail wind in preference to solar whenever it must dispose of surplus. It will
-always curtail wind first — not as an ad-hoc rule, but as the optimum.
-
-\textbf{Grid terms.} The LP buys from the grid at the spot price plus
-$\tau^+ = 11.66$\,€/MWh (\textit{forbrugstarif}) and sells at the spot price
-minus $\tau^- = 1.54$\,€/MWh (\textit{produktionstarif}). At negative spot
-prices the sell revenue $p_t - \tau^-$ goes negative — but since grid\_sell is
-non-negative and enters the objective with a ``minus'' sign, selling at negative
-net revenue is never chosen unless forced by the energy balance.
-
-% ─────────────────────────────────────────────────────────────────────────────
-\subsection*{Constraints}
-
-\subsubsection*{Energy balance (T equalities)}
-
-Every hour the electricity in equals the electricity out:
-
-\begin{equation}
-  c_s\,\text{CF}^s_t + c_w\,\text{CF}^w_t
-  + d_t - u_t
-  + g^+_t - g^-_t
-  - q^s_t - q^w_t = P
-  \quad \forall\, t
-  \label{eq:balance}
-\end{equation}
-
-Left-hand side: gross VE generation, net battery flow (positive = discharge),
-net grid flow (positive = buy), minus curtailment. The right-hand side is the
-fixed demand $P$. This must hold with equality — power cannot be ``stored'' in
-the air; any surplus must be exported, stored, or curtailed.
-
-\subsubsection*{SOC dynamics (T equalities)}
-
-The battery state of charge evolves as:
-
-\begin{equation}
-  s_t = s_{t-1} + \eta_c\, u_t - \frac{d_t}{\eta_d}
-  \quad \forall\, t
-  \label{eq:soc}
-\end{equation}
-
-where $u_t$ and $d_t$ are the AC-side charge and discharge flows (matching the
-energy balance), so that $\eta_c$ and $\eta_d$ capture only the DC cell-level
-losses. The solar capacity factors are measured at the grid metering point
-(AC output of the inverter), so inverter losses are already embedded in the
-input data and must not be double-counted here.
-
-\textbf{Cyclic initial condition.} Rather than assuming $s_{-1} = 0$, the SOC
-recurrence uses a cyclic L matrix with $L_{0,\,T-1} = -1$. This makes the
-implicit prior SOC at $t = 0$ equal to $s_{T-1}$ (the end-of-year state),
-enforcing a self-consistent annual cycle: the battery neither accumulates nor
-drains net energy across the year. In matrix form, the t=0 row reads
-$s_0 - s_{T-1} = \eta_c u_0 - d_0/\eta_d$ rather than $s_0 = \eta_c u_0 -
-d_0/\eta_d$. For typical Danish weather data the constraint is nearly
-non-binding (the battery naturally empties by year-end), but it is correct
-by construction.
-
-\subsubsection*{CFE constraint (T inequalities)}
-
-The legal requirement is that the datacenter sources at least fraction $x$ of
-its electricity on-site \textit{each hour}. Equivalently, grid imports cannot
-exceed the complement:
-
-\begin{equation}
-  g^+_t - e_t \leq \bar{g} = (1-x)\cdot P
-  \quad \forall\, t
-  \label{eq:cfe}
-\end{equation}
-
-The slack variable $e_t \geq 0$ absorbs CFE violations and is penalised at
-$M = 10^6$\,€/MWh in the objective. Binding the constraint hard would risk LP
-infeasibility in hours of extreme shortfall (e.g., dark winter nights with no
-battery left); the soft formulation with a very large penalty always keeps the
-LP feasible while ensuring $e_t \approx 0$ at the optimum. The residual
-$\sum_t e_t$ is reported as \texttt{cfe\_shortfall\_mwh}.
-
-\subsubsection*{Battery bounds (3T inequalities)}
-
-\begin{equation}
-  u_t \leq P_b, \qquad d_t \leq P_b, \qquad s_t \leq E_b
-  \quad \forall\, t
-  \label{eq:batt}
-\end{equation}
-
-Battery power and energy capacity are distinct physical components priced
-separately — the inverter ($P_b$, MW) and the cell stack ($E_b$, MWh). Their
-ratio is fixed by a configurable parameter: $E_b = \text{sh} \times P_b$
-where $\text{sh} = 4$\,h is set exogenously, so only $P_b$ is a free LP
-variable (reducing capacity variables to 3). Setting $\text{sh} = \texttt{None}$
-promotes $E_b$ to a fourth free variable with its own capex term. Round-trip
-efficiency losses are modelled in the SOC recurrence \eqref{eq:soc}; the
-bounds here apply to the AC-side flows.
-
-\subsubsection*{Curtailment bounds (2T inequalities)}
-
-\begin{equation}
-  q^s_t \leq c_s\,\text{CF}^s_t, \qquad q^w_t \leq c_w\,\text{CF}^w_t
-  \quad \forall\, t
-  \label{eq:curtail}
-\end{equation}
-
-You cannot curtail more of a source than it actually generates in that hour.
-These are linear in the capacity variables because $\text{CF}^s_t$ and
-$\text{CF}^w_t$ are exogenous parameters. Without these bounds the LP could, in
-principle, assign unbounded curtailment credit to wind (since $-\eta < 0$);
-these constraints prevent that.
-
-\subsubsection*{Grid sell bound (T inequalities)}
-
-\begin{equation}
-  g^-_t \leq \bar{g}
-  \quad \forall\, t
-\end{equation}
-
-Grid exports are capped at the same grid connection capacity as imports. This
-prevents the model from building arbitrarily large VE for pure export revenue,
-which would not be commercially realistic for an on-site facility.
-
-\subsubsection*{Grid buy bound and LP feasibility}
-
-The effective constraint is the CFE inequality \eqref{eq:cfe}: $g^+_t \leq
-\bar{g}$ at the optimum (since $e_t = 0$ always holds when $M = 10^6$). The
-\textit{box} bound in the implementation is, however, set to
-\begin{equation}
-  g^+_t \leq P \quad \forall\, t
-\end{equation}
-rather than $\bar{g}$. This is purely a numerical device to keep the LP
-feasible during the simultaneous capacity-and-dispatch solve. Before capacities
-are set, there may be no feasible dispatch with $g^+_t \leq \bar{g}$: a dark,
-windless hour with an empty battery and zero installed VE has no feasible
-solution at the hard cap. Allowing $g^+_t$ up to $P$ and penalising exceedance
-via $e_t$ at $M = 10^6$\,€/MWh ensures the LP is always feasible. At any
-economically rational optimum — where the penalty cost would dwarf all other
-costs — $e_t = 0$ and the hard CFE constraint $g^+_t \leq \bar{g}$ is
-\textit{never} violated. The residual $\sum_t e_t$ (reported as
-\texttt{cfe\_shortfall\_mwh}) is zero to numerical precision.
-
-% ─────────────────────────────────────────────────────────────────────────────
-\subsection*{Economic intuition — what is the LP doing?}
-
-Think of the LP as a \textbf{perfect-foresight central planner} who knows all
-8{,}760 spot prices for the year and chooses, once, how much to build and how to
-dispatch every hour.
-
-\textbf{Capacity sizing.} The planner trades off capital cost against
-operational flexibility. More solar and wind reduce grid purchases but require
-more curtailment management and battery storage to satisfy the hourly CFE
-constraint. More battery allows the planner to smooth VE variability and shift
-cheap renewable energy to Dunkelflaute hours, but battery is expensive. The
-optimal capacity mix is the one where the marginal cost of adding another MW of
-any technology equals the marginal value of the dispatch flexibility it provides
-across all 8{,}760 hours simultaneously.
-
-\textbf{Dispatch logic in surplus hours.} When VE generation exceeds demand the
-LP can: (i) charge the battery, (ii) export to the grid, or (iii) curtail.
-Exporting earns revenue $(p_t - \tau^-)$ and is preferred when spot prices are
-high. Charging the battery is free (no variable cost) and valuable when future
-hours are expected to have a deficit. Curtailment is the last resort — but since
-curtailing wind saves $\eta = 1.98$\,€/MWh in O\&M, wind is always curtailed
-before solar.
-
-\textbf{Dispatch logic in deficit hours.} When VE generation falls short of the
-required on-site floor $x \cdot P$, the LP can: (i) discharge the battery or
-(ii) accept a CFE penalty. Discharging costs nothing in variable terms; the
-penalty $M$ is prohibitively large. In practice the LP sizes the battery large
-enough to avoid all CFE violations.
-
-\textbf{Interaction between curtailment and battery.} Because curtailing wind is
-beneficial ($-\eta < 0$ in the objective), the LP has an incentive to use
-battery capacity to absorb solar surplus (freeing up the energy balance to
-curtail wind). This creates a feedback: larger battery $\Rightarrow$ more wind
-curtailment enabled $\Rightarrow$ lower wind O\&M cost. The battery and
-curtailment decisions are not separable.
-
-% ─────────────────────────────────────────────────────────────────────────────
-\subsection*{The LP solve — structure and solver}
-
-\textbf{Matrix form.} The LP is written as
-
-\[
-  \min_{\mathbf{x}} \; \mathbf{c}^\top \mathbf{x}
-  \quad \text{s.t.} \quad
-  A_{\text{eq}}\, \mathbf{x} = \mathbf{b}_{\text{eq}}, \quad
-  A_{\text{ub}}\, \mathbf{x} \leq \mathbf{b}_{\text{ub}}, \quad
-  \mathbf{l} \leq \mathbf{x} \leq \mathbf{u}
-\]
-
-where all matrices are assembled in \texttt{scipy.sparse} CSR format. Sparsity
-is critical: the energy balance and SOC constraints each touch only $O(1)$
-non-zeros per row, giving a matrix $A_{\text{eq}}$ of size
-$2T \times (4 + 8T)$ with roughly $8$ non-zeros per row rather than
-$4 + 8T \approx 70{,}088$ in a dense representation.
-
-The constraint blocks are:
-
-\medskip
-{\small
-\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}X l l}
-\toprule
-Block & Type & Rows \\
-\midrule
-Energy balance (\ref{eq:balance}) & equality & $T$ \\
-SOC recurrence (\ref{eq:soc}) & equality & $T$ \\
-CFE inequality (\ref{eq:cfe}) & inequality & $T$ \\
-Battery charge bound (\ref{eq:batt}) & inequality & $T$ \\
-Battery discharge bound (\ref{eq:batt}) & inequality & $T$ \\
-Battery SOC bound (\ref{eq:batt}) & inequality & $T$ \\
-Solar curtailment bound (\ref{eq:curtail}) & inequality & $T$ \\
-Wind curtailment bound (\ref{eq:curtail}) & inequality & $T$ \\
-\bottomrule
-\end{tabularx}}
-
-\medskip
-Total: $2T$ equality rows and $6T$ inequality rows, plus simple box constraints
-on each variable. With $T = 8{,}760$ this gives roughly $52{,}560$ constraints
-over $70{,}084$ variables.
-
-\textbf{Solver.} The problem is passed to \textbf{HiGHS} via
-\texttt{scipy.optimize.linprog(..., method='highs')}. HiGHS is a
-state-of-the-art open-source LP/MIP solver that uses a \textit{revised dual
-simplex} method (with possible interior-point warm-start) and aggressive
-sparsity exploitation. The solve typically completes in a few seconds on a
-single thread.
-
-\textbf{Perfect foresight.} The LP assumes the planner knows all spot prices
-$p_1, \ldots, p_T$ at the time of dispatch. This is an idealisation: a real
-operator would face uncertainty and solve a receding-horizon stochastic
-programme. Perfect foresight gives a \textit{lower bound} on actual operating
-costs, so VE costs reported here are optimistic relative to real-world
-performance. KK does not face this issue — the SMR runs at constant output
-and the outage window is chosen using the same perfect-foresight assumption
-(minimise $\sum_{t \in \text{outage}} (p_t + \tau^+)$ over all contiguous
-windows of length $0.10 \times T$).
+\textbf{Solver.} Assembled in \texttt{scipy.sparse} CSR format ($2T$ equality rows,
+$6T$ inequality rows, ${\sim}70{,}084$ variables) and passed to \textbf{HiGHS} via
+\texttt{scipy.optimize.linprog(..., method='highs')}. Solves in seconds on a single
+thread.
 
 % ─────────────────────────────────────────────────────────────────────────────
 \subsection*{KK benchmark}
 
-The SMR option requires no LP. Output is constant and the problem reduces to
-placing a single maintenance window, making the cost fully analytical.
+No LP is needed. Output is constant at 1{,}000\,MW; the only decision is where to
+place the $\delta T = 876$-hour maintenance window.
 
-\textbf{Dispatch.} A single 1{,}000\,MW reactor runs at full output for every
-hour of the year except a contiguous block of $\delta T = 0.10 \times 8{,}760 =
-876$ hours of planned maintenance. Outside the outage, the reactor exactly
-meets demand with no grid interaction; no battery or VE capacity is needed. The
-SMR is sized at exactly $P = 1{,}000$\,MW — no oversizing.
+\textbf{Outage placement.} The window is placed at the cheapest contiguous block:
+$k^* = \arg\min_k \sum_{t=k}^{k+875}(p_t+\tau^+)$, found in $O(T)$ via cumulative sum.
 
-\textbf{Outage placement.} The 876-hour window is placed at the cheapest
-available hours to minimise grid expenditure during downtime. Define the total
-grid cost for a window starting at hour $k$:
+\textbf{CFE exemption.} During the outage the datacenter imports 1{,}000\,MW —
+above $\bar{g}$ — and the hourly CFE constraint is waived (planned maintenance
+exemption). Grid connection is sized for 1{,}000\,MW import regardless of $x$.
+
+\textbf{Total cost.}
 \[
-  C(k) = \sum_{t=k}^{k+876-1} (p_t + \tau^+) \cdot P
+  C_{\text{KK}} =
+    \text{capex}_{\text{KK}}\cdot\text{CRF}_{\text{KK}}\cdot P
+    + \text{opex}^v_{\text{KK}}\cdot P(1-\delta)T
+    + \sum_{t \in \mathcal{O}} (p_t + \tau^+)\cdot P
+    + \text{gc}(P)
 \]
-The optimal start is $k^* = \arg\min_k C(k)$, found in $O(T)$ via a cumulative
-sum. In the 2025--26 data this places the outage in late May to late June, when
-spot prices are low due to high Nordic hydro and solar output.
 
-\textbf{CFE constraint during outage.} During the 876-hour outage the
-datacenter must import $P = 1{,}000$\,MW — far above the hourly CFE cap
-$\bar{g} = (1-x)\cdot P$. Planned maintenance is treated as a regulatory
-exemption: the CFE constraint is waived for these hours. Grid connection costs
-are internalised via the tilslutningsbidrag (see below), which is sized for the
-full 1{,}000\,MW import.
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection*{VEGAS — VE + gas turbine, two-stage LP + MILP}
 
-\textbf{Cost components.} Total annual KK cost:
-\begin{align*}
-  C_{\text{KK}} &=
-    \underbrace{\text{capex}_{\text{KK}} \cdot \text{CRF}_{\text{KK}} \cdot P
-                + \text{opex}^v_{\text{KK}} \cdot P\,(1-\delta)T}_{\text{on-site: capex + fuel + O\&M}} \\
-  &\quad
-    + \underbrace{\sum_{t \in \mathcal{O}} (p_t + \tau^+) \cdot P}_{\text{grid purchase during outage}}
-    + \underbrace{\text{gc}(P)}_{\text{grid connection}}
-\end{align*}
+\textbf{Setup.} A CCGT on green gas is added as a fourth on-site source. At
+$\approx$115\,€/MWh variable cost it is last in the merit order; it fires only during
+Dunkelflaute when VE and battery cannot meet the CFE floor.
 
-where $\text{opex}^v_{\text{KK}} \approx 31.08$\,€/MWh covers fuel ($9.32$),
-variable O\&M ($20.42$), and an ET policy surcharge ($1.34$), and
-$\text{gc}(P)$ is the annualised tilslutningsbidrag for a $P = 1{,}000$\,MW
-connection.
+\textbf{Stage 1 — LP for capacities.} The VE LP is extended with:
+\begin{itemize}[noitemsep,topsep=2pt]
+  \item a fifth capacity variable $c_g$ with annualised cost coefficient
+        $\alpha_g = \text{capex}_g\cdot\text{CRF}_g + \text{opex}^f_g$;
+  \item an hourly dispatch variable $z_t \in [0, c_g]$, entering the energy
+        balance \eqref{eq:bal} as an additional source (replace $c_s\,\text{CF}^s_t
+        + c_w\,\text{CF}^w_t$ with $c_s\,\text{CF}^s_t + c_w\,\text{CF}^w_t + z_t$);
+  \item the hourly gas cost $\text{opex}^v_g\cdot z_t$ added to the objective.
+\end{itemize}
+This LP gives optimal capacities $(c_s^*, c_w^*, P_b^*, E_b^*, c_g^*)$ in one call to
+HiGHS. The minimum-load constraint is absent here because it is non-convex with $c_g$
+as a variable (bilinear term $c_g \cdot o_t$).
 
-\textbf{No battery, no export.} KK never exports to the grid and carries no
-battery. Outside the outage it is self-sufficient; during the outage it
-relies entirely on grid import. This simplicity is also a vulnerability: the
-outage cost is fully exposed to whatever spot prices prevail in the chosen
-window, with no storage buffer.
+\textbf{Stage 2 — MILP for dispatch (fixed $c_g^*$).} With $c_g^*$ fixed, add a binary
+$o_t \in \{0,1\}$ for each hour and resolve dispatch. The minimum-load constraints are
+now linear in $(z_t,\, o_t)$:
+
+\begin{align}
+  z_t &\leq c_g^*\, o_t && \forall\,t \quad\text{(off if }o_t=0\text{)} \label{eq:gas_up}\\
+  z_t &\geq \mu\, c_g^*\, o_t && \forall\,t \quad\text{(min load }{\mu=0.40}\text{ if on)} \label{eq:gas_lo}
+\end{align}
+
+These force $z_t \in \{0\} \cup [\mu c_g^*,\, c_g^*]$ in each hour. The remaining
+MILP constraints are the same as the VE LP (energy balance, SOC recurrence, CFE,
+battery limits, curtailment). Solved by \textbf{HiGHS} via
+\texttt{scipy.optimize.milp} (scipy\,$\geq$\,1.9).
+
+\textbf{MILP variable layout} ($10T$ variables, $T$ binaries):
+
+{\footnotesize
+\begin{tabularx}{\linewidth}{l l >{\raggedright\arraybackslash}X}
+\toprule
+Block & Size & Notes \\
+\midrule
+Gas on/off $o_t$ & $T$ (binary) & integrality = 1 \\
+Battery charge $u_t$, discharge $d_t$, SOC $s_t$ & $3T$ & continuous \\
+Gas generation $z_t$ & $T$ & $[0, c_g^*]$ \\
+Grid buy $g^+_t$, sell $g^-_t$ & $2T$ & box bounded \\
+Solar curtailment $q^s_t$, wind curtailment $q^w_t$ & $2T$ & \\
+CFE slack $e_t$ & $T$ & penalised \\
+\bottomrule
+\end{tabularx}}
+
+\smallskip
+\textbf{Constraint count:} 5$T$ rows — energy balance ($T$, equality), SOC ($T$, equality),
+CFE ($T$, $\leq$), gas upper (\ref{eq:gas_up}) ($T$, $\leq$), gas min-load (\ref{eq:gas_lo}) ($T$, $\leq$).
+
+\textbf{Approximation.} The LP (Stage 1) ignores the minimum-load constraint, so it may
+slightly undersize $c_g^*$ relative to the true joint optimum. The error is small when
+gas runs infrequently (few $o_t=1$ hours), which is the expected regime (Dunkelflaute only).
 
 % ─────────────────────────────────────────────────────────────────────────────
 \subsection*{Outputs and comparison}
 
-After solving, the LP returns:
-
-\begin{itemize}[noitemsep]
-  \item Optimal capacities: $c_s^*,\, c_w^*,\, P_b^*,\, E_b^*$.
-  \item Full hourly dispatch arrays: $u_t,\, d_t,\, s_t,\, g^+_t,\, g^-_t,\,
-        q^s_t,\, q^w_t,\, e_t$ for all $t$.
-  \item Total annual cost (€/yr) and LCOE (€/MWh) for the VE scenario.
-\end{itemize}
-
-The comparison metric is \textbf{total annualised cost}: capex (annualised),
-fixed O\&M, variable O\&M on dispatched generation, net grid expenditure
-(purchases minus export revenue), grid running tariffs, and annualised
-tilslutningsbidrag. The technology with the lower total cost wins for a given
-$(x, \text{year})$ pair. The model is run across years 2022--2025 and
-$x \in \{0.25, 0.50, 0.75\}$ to assess robustness to the on-site requirement
-and input price variation.
+Each scenario returns a \textbf{total annualised cost} (M€/yr): capex$\times$CRF,
+fixed O\&M, variable O\&M on dispatched generation, net grid expenditure (purchases
+minus export revenue), grid tariffs, and tilslutningsbidrag. LCOE (€/MWh) is total
+cost divided by annual demand (8.76\,TWh). The cheapest technology is identified for
+each $(x, \text{year})$ pair; the model is run across 2022--2025 and
+$x \in \{0.25, 0.50, 0.75\}$.
 
 \end{document}

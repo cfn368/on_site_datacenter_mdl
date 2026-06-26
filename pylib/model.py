@@ -273,6 +273,7 @@ class VESupply:
         tol_energy:          float = 1.0,           # MWh — inner bisection tolerance
         tol_ve:              float = 1.0,           # MW  — outer Nelder-Mead tolerance
         max_solar_mw:        float | None = None,   # upper bound on c_solar (e.g. area cap)
+        max_wind_mw:         float | None = None,   # upper bound on c_wind
     ):
         if len(solar_cf) != demand.HOURS or len(wind_cf) != demand.HOURS:
             raise ValueError(f"Capacity factor arrays must match demand.HOURS ({demand.HOURS})")
@@ -294,6 +295,7 @@ class VESupply:
         self.tol_energy          = tol_energy
         self.tol_ve              = tol_ve
         self.max_solar_mw        = max_solar_mw
+        self.max_wind_mw         = max_wind_mw
         self._solution: tuple[float, float, float, float] | None = None  # (c_solar, c_wind, batt_power, batt_energy)
         self._lp_cache: dict | None = None
 
@@ -527,8 +529,9 @@ class VESupply:
         # ── bounds ────────────────────────────────────────────────────────────
 
         cap_bounds = (
-            [(0.0, self.max_solar_mw)]   # c_solar (may be area-capped)
-            + [(0.0, None)] * (N_cap - 1)
+            [(0.0, self.max_solar_mw),   # c_solar
+             (0.0, self.max_wind_mw)]    # c_wind
+            + [(0.0, None)] * (N_cap - 2)
         )
         bounds = (
             cap_bounds
@@ -863,6 +866,7 @@ class VEGasSupply:
         cfe_penalty:         float = 1e6,
         min_load:            float = 0.0,   # minimum stable load fraction; triggers MILP dispatch when > 0
         max_solar_mw:        float | None = None,   # upper bound on c_solar (e.g. area cap)
+        max_wind_mw:         float | None = None,   # upper bound on c_wind
     ):
         if len(solar_cf) != demand.HOURS or len(wind_cf) != demand.HOURS:
             raise ValueError(f"CF arrays must match demand.HOURS ({demand.HOURS})")
@@ -883,6 +887,7 @@ class VEGasSupply:
         self.cfe_penalty         = cfe_penalty
         self.min_load            = min_load
         self.max_solar_mw        = max_solar_mw
+        self.max_wind_mw         = max_wind_mw
         self._lp_cache: dict | None = None
 
     def _single_lp(self) -> dict | None:
@@ -977,8 +982,9 @@ class VEGasSupply:
         b_ub = np.concatenate([np.full(T, g), np.zeros(6 * T)])
 
         bounds = (
-            [(0.0, self.max_solar_mw)]   # c_solar (may be area-capped)
-            + [(0.0, None)] * (N_cap - 1)
+            [(0.0, self.max_solar_mw),   # c_solar
+             (0.0, self.max_wind_mw)]    # c_wind
+            + [(0.0, None)] * (N_cap - 2)
             + [(0.0, None)] * (3 * T)   # charge, discharge, soc
             + [(0.0, d)]    * T         # gas_gen (loose; tight via gas capacity constraint)
             + [(0.0, d)]    * T         # grid_buy ≤ demand_mw
