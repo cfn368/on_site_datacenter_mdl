@@ -1016,6 +1016,34 @@ class VEGasSupply:
             self._lp_cache = self._single_lp()
         return self._lp_cache
 
+    @property
+    def solution(self) -> tuple[float, float, float, float]:
+        """(c_solar, c_wind, batt_power, batt_energy) — compatible with VESupply interface."""
+        lp = self.lp_detail()
+        return lp['c_solar'], lp['c_wind'], lp['batt_power'], lp['batt_energy']
+
+    def save_lp_arrays(self, path: str | pathlib.Path = 'runs/vegas_lp_arrays.npz') -> None:
+        """Save LP arrays (capacities + dispatch) to npz."""
+        lp = self.lp_detail()
+        if lp is None:
+            raise RuntimeError("LP not solved.")
+        p = pathlib.Path(path)
+        p.parent.mkdir(exist_ok=True)
+        save_keys = ['c_solar', 'c_wind', 'batt_power', 'batt_energy', 'c_gas',
+                     'charge', 'discharge', 'soc', 'gas_gen',
+                     'grid_buy', 'grid_sell',
+                     'curtail', 'curtail_pv', 'curtail_wl', 'cfe_excess', 'pv_gen', 'wl_gen']
+        np.savez(str(p), **{k: lp[k] for k in save_keys if k in lp})
+
+    def load_lp_arrays(self, path: str | pathlib.Path = 'runs/vegas_lp_arrays.npz') -> None:
+        """Load LP arrays from npz, bypassing the LP solve."""
+        data  = np.load(str(pathlib.Path(path)))
+        cache = {k: data[k] for k in data.files}
+        for k in ('c_solar', 'c_wind', 'batt_power', 'batt_energy', 'c_gas'):
+            if k in cache:
+                cache[k] = float(cache[k])
+        self._lp_cache = cache
+
     def result(self, grid: GridSupply) -> Result:
         lp = self.lp_detail()
         if lp is None:

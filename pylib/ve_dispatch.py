@@ -40,6 +40,7 @@ DISPATCH_COLORS = {
     'pv':       '#F2C94C',   # amber gold        — solar
     'exported': '#8C7B72',   # warm medium grey  — grid export (same family as import)
     'nuclear':  '#4472C4',   # steel blue        — nuclear on-site production
+    'gas':      '#70AD47',   # muted green       — gas turbine on-site
 }
 
 
@@ -76,10 +77,11 @@ def _dispatch_from_lp(lp: dict, demand_mw: float) -> dict:
     ve_gen         = lp['pv_gen'] + lp['wl_gen']
     discharge_grid = np.minimum(lp['discharge'], lp['grid_sell'])
     batt_to_demand = lp['discharge'] - discharge_grid
+    gas_to_demand  = lp.get('gas_gen', np.zeros(len(lp['grid_buy'])))
     grid_to_demand = lp['grid_buy']
-    ve_to_demand   = demand_mw - batt_to_demand - grid_to_demand
+    ve_to_demand   = demand_mw - gas_to_demand - batt_to_demand - grid_to_demand
     frac_pv        = np.where(ve_gen > 1e-9, lp['pv_gen'] / ve_gen, 0.0)
-    return dict(
+    out = dict(
         pv       = ve_to_demand * frac_pv,
         wind     = ve_to_demand * (1.0 - frac_pv),
         battery  = batt_to_demand,
@@ -87,6 +89,9 @@ def _dispatch_from_lp(lp: dict, demand_mw: float) -> dict:
         grid     = grid_to_demand,
         exported = lp['grid_sell'],
     )
+    if 'gas_gen' in lp:
+        out['gas'] = gas_to_demand
+    return out
 
 
 def dispatch_detail(ve, solar_cf, wind_cf):
@@ -234,20 +239,26 @@ def _month_ticks(idx):
 
 def plot_dispatch(d_agg, idx, ylabel, save_path=None, title="", subtitle=""):
     """
-    Stacked area dispatch plot for a VE scenario.
-    Positive stacks: grid, battery, wind, pv. Negative fill: export.
+    Stacked area dispatch plot.
+    Positive stacks: grid, gas (if present), battery, wind, pv.
+    Negative fill: export, then battery charge.
     """
-    x = np.arange(len(idx))
-    C = DISPATCH_COLORS
+    x    = np.arange(len(idx))
+    C    = DISPATCH_COLORS
+    has_gas = 'gas' in d_agg
     fig, ax = plt.subplots(figsize=(12, 7))
 
-    ax.stackplot(
-        x,
-        d_agg['grid'], d_agg['battery'], d_agg['wind'], d_agg['pv'],
-        labels=['Køb', 'Batteriafladning', 'Vind', 'Sol'],
-        colors=[C['grid'], C['battery'], C['wind'], C['pv']],
-        linewidth=0,
-    )
+    if has_gas:
+        stacks  = [d_agg['grid'], d_agg['gas'], d_agg['battery'], d_agg['wind'], d_agg['pv']]
+        slabels = ['Køb', 'Gas', 'Batteriafladning', 'Vind', 'Sol']
+        scolors = [C['grid'], C['gas'], C['battery'], C['wind'], C['pv']]
+    else:
+        stacks  = [d_agg['grid'], d_agg['battery'], d_agg['wind'], d_agg['pv']]
+        slabels = ['Køb', 'Batteriafladning', 'Vind', 'Sol']
+        scolors = [C['grid'], C['battery'], C['wind'], C['pv']]
+
+    ax.stackplot(x, *stacks, labels=slabels, colors=scolors, linewidth=0)
+
     neg_base = -d_agg['exported']
     ax.fill_between(x, 0, neg_base,
                     label='Salg', color=C['exported'], linewidth=0)
@@ -263,8 +274,10 @@ def plot_dispatch(d_agg, idx, ylabel, save_path=None, title="", subtitle=""):
 
     handles, labels = ax.get_legend_handles_labels()
     lut = dict(zip(labels, handles))
-    order = ['Vind', 'Sol', 'Batteriladning', 'Batteriafladning', 'Køb', 'Salg']
-    ax.legend([lut[l] for l in order], order,
+    order = (['Vind', 'Sol', 'Batteriladning', 'Batteriafladning', 'Gas', 'Køb', 'Salg']
+             if has_gas else
+             ['Vind', 'Sol', 'Batteriladning', 'Batteriafladning', 'Køb', 'Salg'])
+    ax.legend([lut[l] for l in order if l in lut], [l for l in order if l in lut],
               loc='upper center', bbox_to_anchor=(0.5, -0.12),
               ncol=len(order))
 
