@@ -66,13 +66,15 @@ Additional fixed costs: solar land rent (4,800 €/MW/yr), grid connection fee (
 
 At low `x` the VE optimum involves a large solar overbuild that generates substantial export revenue, making VE cheaper than KK. At high `x` the on-site floor tightens, the export cap shrinks, and KK's stable output becomes the cheaper option.
 
-Solar land use: 10 ha/MW (100 km²/GW), at a land rent of 3,581 DKK/ha/yr ≈ 4,800 €/MW/yr. The `max_solar_mw` constructor parameter caps installed solar capacity, enabling area-constraint sensitivity analysis.
+Solar land use: 10 ha/MW (100 km²/GW), at a land rent of 3,581 DKK/ha/yr ≈ 4,800 €/MW/yr. The `max_solar_mw` and `max_wind_mw` constructor parameters cap installed capacities, enabling area-constraint and grid-connection sensitivity analysis.
 
 ### VEGAS
 
 VEGAS adds a gas turbine (CCGT, green gas) as a fourth on-site technology alongside VE's solar, wind, and battery. The gas plant is last in the merit order at roughly 115 €/MWh variable cost (green gas at 100 DKK/GJ, 45% effective efficiency including startup losses, plus a 25 DKK/MWh tariff). It fires only during Dunkelflaute — winter periods when VE and battery combined cannot meet the hourly CFE floor.
 
 The solve is a single joint MILP. All capacities (solar, wind, battery, gas — four variables at fixed battery duration) and all 8,760-hour dispatch decisions are optimised simultaneously. Gas must satisfy a 40% minimum stable load — the turbine either runs at ≥ 40% of rated capacity or not at all. This non-convex constraint involves the bilinear product `c_gas × on[t]`, which is linearised exactly via McCormick envelopes: an auxiliary `w[t] = c_gas × on[t]` is introduced with three inequalities per hour. Solved by HiGHS via `scipy.optimize.milp`.
+
+When solar and wind are capped via `max_solar_mw` and `max_wind_mw`, those capacity variables are fixed at their bounds (lb = ub = cap). HiGHS presolve eliminates them before branch-and-bound begins, tightening the LP relaxation at every node. The solver stops at `mip_rel_gap = 0.10`; the actual optimality gap at termination is typically well under 1% — within the 10–20% uncertainty of the underlying cost assumptions. With both caps set, the full 8,760-hour MILP solves in approximately 8–9 minutes on a single thread.
 
 ## How to run
 
@@ -86,7 +88,7 @@ setup_notebook()
 Run in order:
 
 1. `1_input.ipynb` — fetches variation patterns from Energi Data Service and writes them to `variation_patterns/`. Requires internet access and the `ET-eds-api` package.
-2. `2_model.ipynb` — loads inputs, runs KK, VE (LP), and VEGAS (joint MILP), prints the three-way cost comparison, and saves solutions to `runs/`. VE solves in seconds; VEGAS may take several minutes for the joint MILP.
+2. `2_model.ipynb` — loads inputs, runs KK, VE (LP), and VEGAS (joint MILP), prints the three-way cost comparison, and saves solutions to `runs/`. VE solves in seconds; VEGAS solves in approximately 8–9 minutes (with VE caps set and `mip_rel_gap = 0.10`).
 3. `3_time_series.ipynb` — loads the cached solution and produces dispatch and battery figures for VE, the KK hourly profile showing the planned outage window, and a weekly curtailment plot split by wind and solar.
 4. `4_cases.ipynb` — runs both models across years (2022–2025) and on-site fractions (25/50/75 %) and prints the results table.
 

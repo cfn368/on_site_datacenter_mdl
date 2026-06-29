@@ -191,9 +191,11 @@ charge level it started, with no net energy accumulation.
 $e_t$ absorbs violations at penalty $M=10^6$\,€/MWh, ensuring the LP is always feasible
 during the simultaneous capacity-and-dispatch solve. At the optimum $e_t=0$.
 
-\textbf{Area cap.} Optional parameter \texttt{max\_solar\_mw} adds the bound
-$c_s \leq \overline{c}_s$ directly in the LP, enabling sensitivity analysis on solar
-land availability (100\,km²/GW at 10\,ha/MW).
+\textbf{Capacity caps.} Optional parameters \texttt{max\_solar\_mw} and
+\texttt{max\_wind\_mw} add bounds $c_s \leq \overline{c}_s$ and $c_w \leq
+\overline{c}_w$ directly in the LP, enabling sensitivity analysis on land
+availability and grid connection constraints (solar: 100\,km²/GW at
+10\,ha/MW).
 
 \textbf{Solver.} Assembled in \texttt{scipy.sparse} CSR format ($2T$ equality rows,
 $6T$ inequality rows, ${\sim}70{,}084$ variables) and passed to \textbf{HiGHS} via
@@ -277,6 +279,21 @@ On/off $o_t$ & $T$ (binary) & integrality\,=\,1 \\
 \textbf{Constraint count:} $13T$ rows — energy balance ($T$, eq.), SOC ($T$, eq.),
 CFE ($T$), battery ($3T$), curtailment ($2T$), gas dispatch (\ref{eq:gas_up}--\ref{eq:gas_lo}, $2T$),
 McCormick (\ref{eq:mc1}--\ref{eq:mc3}, $3T$).
+
+\textbf{Presolve acceleration.} When both \texttt{max\_solar\_mw} and
+\texttt{max\_wind\_mw} are set, $c_s$ and $c_w$ are fixed at their caps
+($\ell_b = u_b = \text{cap}$). HiGHS presolve eliminates them before
+branch-and-bound begins, tightening the LP relaxation at every B\&B node and
+reducing effective problem size.
+
+\textbf{Optimality gap.} The solver halts when
+\[
+  \frac{\text{incumbent} - \text{LP lower bound}}{\text{incumbent}} \;\leq\; 0.10
+\]
+(parameter \texttt{mip\_rel\_gap}\,=\,0.10). With fixed VE caps the actual gap at
+termination is typically $\ll 1\,\%$ (0.75\,\% in the baseline 2025--2026 run),
+well within the 10--20\,\% uncertainty of the underlying cost assumptions. The full
+8{,}760-hour MILP solves in approximately 8--9 minutes on a single thread.
 
 % ─────────────────────────────────────────────────────────────────────────────
 \subsection*{Outputs and comparison}
