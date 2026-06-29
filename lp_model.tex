@@ -47,8 +47,8 @@ Three on-site options are compared on \textbf{total annualised cost}:
   \item \textbf{VE} — jointly optimised solar PV, onshore wind, and BESS.
         Single LP over capacities and all 8{,}760-h dispatch simultaneously.
   \item \textbf{VEGAS} — VE + gas turbine (CCGT, green gas). Gas is last in
-        the merit order. Two-stage solve: LP for capacities, MILP for dispatch
-        with a 40\,\% minimum-load constraint.
+        the merit order. Single joint MILP with McCormick linearisation enforcing
+        a 40\,\% minimum-load constraint on the gas turbine.
 \end{itemize}
 
 % ─────────────────────────────────────────────────────────────────────────────
@@ -223,62 +223,60 @@ exemption). Grid connection is sized for 1{,}000\,MW import regardless of $x$.
 \]
 
 % ─────────────────────────────────────────────────────────────────────────────
-\subsection*{VEGAS — VE + gas turbine, two-stage LP + MILP}
+\subsection*{VEGAS — VE + gas turbine, single joint MILP}
 
 \textbf{Setup.} A CCGT on green gas is added as a fourth on-site source. At
 $\approx$115\,€/MWh variable cost it is last in the merit order; it fires only during
 Dunkelflaute when VE and battery cannot meet the CFE floor.
 
-\textbf{Stage 1 — LP for capacities.} The VE LP is extended with:
-\begin{itemize}[noitemsep,topsep=2pt]
-  \item a fifth capacity variable $c_g$ with annualised cost coefficient
-        $\alpha_g = \text{capex}_g\cdot\text{CRF}_g + \text{opex}^f_g$;
-  \item an hourly dispatch variable $z_t \in [0, c_g]$, entering the energy
-        balance \eqref{eq:bal} as an additional source (replace $c_s\,\text{CF}^s_t
-        + c_w\,\text{CF}^w_t$ with $c_s\,\text{CF}^s_t + c_w\,\text{CF}^w_t + z_t$);
-  \item the hourly gas cost $\text{opex}^v_g\cdot z_t$ added to the objective.
-\end{itemize}
-This LP gives optimal capacities $(c_s^*, c_w^*, P_b^*, E_b^*, c_g^*)$ in one call to
-HiGHS. The minimum-load constraint is absent here because it is non-convex with $c_g$
-as a variable (bilinear term $c_g \cdot o_t$).
+\textbf{Problem.} The VE LP is extended with a fifth capacity variable $c_g$, hourly
+dispatch $z_t$, and binary on/off $o_t \in \{0,1\}$. The minimum-load constraint
+$z_t \in \{0\} \cup [\mu c_g, c_g]$ ($\mu = 0.40$) involves the bilinear product
+$c_g \cdot o_t$, which is non-convex when $c_g$ is also a decision variable.
 
-\textbf{Stage 2 — MILP for dispatch (fixed $c_g^*$).} With $c_g^*$ fixed, add a binary
-$o_t \in \{0,1\}$ for each hour and resolve dispatch. The minimum-load constraints are
-now linear in $(z_t,\, o_t)$:
+\textbf{McCormick linearisation.} Introduce auxiliary $w_t = c_g \cdot o_t$ with
+three inequalities per hour, using big-M bound $\bar{C} = P$ (demand~MW):
 
 \begin{align}
-  z_t &\leq c_g^*\, o_t && \forall\,t \quad\text{(off if }o_t=0\text{)} \label{eq:gas_up}\\
-  z_t &\geq \mu\, c_g^*\, o_t && \forall\,t \quad\text{(min load }{\mu=0.40}\text{ if on)} \label{eq:gas_lo}
+  w_t &\leq \bar{C}\, o_t               && \label{eq:mc1}\\
+  w_t &\leq c_g                          && \label{eq:mc2}\\
+  c_g + \bar{C}\, o_t - w_t &\leq \bar{C} && \label{eq:mc3}
 \end{align}
 
-These force $z_t \in \{0\} \cup [\mu c_g^*,\, c_g^*]$ in each hour. The remaining
-MILP constraints are the same as the VE LP (energy balance, SOC recurrence, CFE,
-battery limits, curtailment). Solved by \textbf{HiGHS} via
-\texttt{scipy.optimize.milp} (scipy\,$\geq$\,1.9).
+At integer $o_t$, these force $w_t = c_g \cdot o_t$ exactly. The gas dispatch
+constraints become linear:
 
-\textbf{MILP variable layout} ($10T$ variables, $T$ binaries):
+\begin{align}
+  z_t &\leq w_t           && \forall\,t \label{eq:gas_up}\\
+  z_t &\geq \mu\, w_t     && \forall\,t \label{eq:gas_lo}
+\end{align}
+
+All capacities ($N_\text{cap} = 4$ at fixed battery duration, or 5 when battery
+energy is also free) and all 8,760-h dispatch are jointly optimised in a single
+HiGHS call via \texttt{scipy.optimize.milp}.
+
+\textbf{Variable layout} ($N_\text{cap} + 11T$ variables, $T$ binaries):
 
 {\footnotesize
 \begin{tabularx}{\linewidth}{l l >{\raggedright\arraybackslash}X}
 \toprule
 Block & Size & Notes \\
 \midrule
-Gas on/off $o_t$ & $T$ (binary) & integrality = 1 \\
-Battery charge $u_t$, discharge $d_t$, SOC $s_t$ & $3T$ & continuous \\
-Gas generation $z_t$ & $T$ & $[0, c_g^*]$ \\
+Capacities $c_s, c_w, P_b, (E_b), c_g$ & $N_\text{cap}$ & continuous \\
+Charge $u_t$, discharge $d_t$, SOC $s_t$ & $3T$ & continuous \\
+Gas generation $z_t$ & $T$ & $[0, P]$ \\
 Grid buy $g^+_t$, sell $g^-_t$ & $2T$ & box bounded \\
-Solar curtailment $q^s_t$, wind curtailment $q^w_t$ & $2T$ & \\
+Curtailment $q^s_t$, $q^w_t$ & $2T$ & \\
 CFE slack $e_t$ & $T$ & penalised \\
+McCormick auxiliary $w_t$ & $T$ & $[0, \bar{C}]$ \\
+On/off $o_t$ & $T$ (binary) & integrality\,=\,1 \\
 \bottomrule
 \end{tabularx}}
 
 \smallskip
-\textbf{Constraint count:} 5$T$ rows — energy balance ($T$, equality), SOC ($T$, equality),
-CFE ($T$, $\leq$), gas upper (\ref{eq:gas_up}) ($T$, $\leq$), gas min-load (\ref{eq:gas_lo}) ($T$, $\leq$).
-
-\textbf{Approximation.} The LP (Stage 1) ignores the minimum-load constraint, so it may
-slightly undersize $c_g^*$ relative to the true joint optimum. The error is small when
-gas runs infrequently (few $o_t=1$ hours), which is the expected regime (Dunkelflaute only).
+\textbf{Constraint count:} $13T$ rows — energy balance ($T$, eq.), SOC ($T$, eq.),
+CFE ($T$), battery ($3T$), curtailment ($2T$), gas dispatch (\ref{eq:gas_up}--\ref{eq:gas_lo}, $2T$),
+McCormick (\ref{eq:mc1}--\ref{eq:mc3}, $3T$).
 
 % ─────────────────────────────────────────────────────────────────────────────
 \subsection*{Outputs and comparison}

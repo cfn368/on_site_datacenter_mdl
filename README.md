@@ -72,7 +72,7 @@ Solar land use: 10 ha/MW (100 km²/GW), at a land rent of 3,581 DKK/ha/yr ≈ 4,
 
 VEGAS adds a gas turbine (CCGT, green gas) as a fourth on-site technology alongside VE's solar, wind, and battery. The gas plant is last in the merit order at roughly 115 €/MWh variable cost (green gas at 100 DKK/GJ, 45% effective efficiency including startup losses, plus a 25 DKK/MWh tariff). It fires only during Dunkelflaute — winter periods when VE and battery combined cannot meet the hourly CFE floor.
 
-The solve is two-stage. First, a single LP jointly optimises all five capacities (solar, wind, battery power, battery energy, gas) and the full 8,760-hour dispatch. This gives the optimal gas turbine size `c_gas*`. Second, a MILP re-solves dispatch with `c_gas*` fixed and binary on/off variables added for each hour, enforcing a 40% minimum stable load: the gas turbine either runs at ≥ 40% of rated capacity or not at all. Fixing `c_gas*` between stages keeps the MILP constraints linear. Both solves use HiGHS (via `scipy.optimize.linprog` and `scipy.optimize.milp` respectively).
+The solve is a single joint MILP. All capacities (solar, wind, battery, gas — four variables at fixed battery duration) and all 8,760-hour dispatch decisions are optimised simultaneously. Gas must satisfy a 40% minimum stable load — the turbine either runs at ≥ 40% of rated capacity or not at all. This non-convex constraint involves the bilinear product `c_gas × on[t]`, which is linearised exactly via McCormick envelopes: an auxiliary `w[t] = c_gas × on[t]` is introduced with three inequalities per hour. Solved by HiGHS via `scipy.optimize.milp`.
 
 ## How to run
 
@@ -86,7 +86,7 @@ setup_notebook()
 Run in order:
 
 1. `1_input.ipynb` — fetches variation patterns from Energi Data Service and writes them to `variation_patterns/`. Requires internet access and the `ET-eds-api` package.
-2. `2_model.ipynb` — loads inputs, runs KK, VE (LP), and VEGAS (LP + MILP), prints the three-way cost comparison, and saves solutions to `runs/`. VE solves in seconds; VEGAS adds ~1–2 minutes for the MILP dispatch stage.
+2. `2_model.ipynb` — loads inputs, runs KK, VE (LP), and VEGAS (joint MILP), prints the three-way cost comparison, and saves solutions to `runs/`. VE solves in seconds; VEGAS may take several minutes for the joint MILP.
 3. `3_time_series.ipynb` — loads the cached solution and produces dispatch and battery figures for VE, the KK hourly profile showing the planned outage window, and a weekly curtailment plot split by wind and solar.
 4. `4_cases.ipynb` — runs both models across years (2022–2025) and on-site fractions (25/50/75 %) and prints the results table.
 

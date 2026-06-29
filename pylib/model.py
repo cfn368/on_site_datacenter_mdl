@@ -891,6 +891,8 @@ class VEGasSupply:
         self._lp_cache: dict | None = None
 
     def _single_lp(self) -> dict | None:
+        if self.min_load > 0:
+            return self._mccormick_milp()
         from scipy.sparse import eye as speye, diags, hstack, vstack, csr_matrix
         from scipy.optimize import linprog
 
@@ -1027,106 +1029,171 @@ class VEGasSupply:
             'wl_gen':      c_w * self.wind_cf,
         }
 
-    def _dispatch_milp(self, c_solar: float, c_wind: float,
-                       batt_power: float, batt_energy: float, c_gas: float) -> dict:
+    def _mccormick_milp(self) -> dict | None:
         """
-        MILP dispatch with minimum-load constraint, given fixed capacities from the LP.
+        Joint MILP: all capacities + dispatch, with on[t] binary.
+        McCormick linearisation introduces w[t] = c_gas × on[t] via three inequalities:
+          w ≤ C_max·on,  w ≤ c_gas,  c_gas + C_max·on - w ≤ C_max
+        so gas_gen ∈ {0} ∪ [min_load·c_gas, c_gas] is enforced exactly.
+        C_max = demand_mw is the big-M bound on c_gas.
 
-        Adds T binary on[t] variables. Constraint: gas_gen[t] ∈ {0} ∪ [min_load*c_gas, c_gas].
-        Linearised as: gas_gen ≤ c_gas*on  AND  gas_gen ≥ min_load*c_gas*on.
-        (c_gas is a scalar here so both constraints are linear in on[t] and gas_gen[t].)
+        When both max_solar_mw and max_wind_mw are set, c_solar and c_wind are fixed
+        at their caps (lb = ub = cap) so HiGHS presolve eliminates them, tightening
+        the LP relaxation at every B&B node.
 
-        Variable layout (10T): on charge discharge soc gas_gen grid_buy grid_sell
-                                curtail_pv curtail_wl cfe_excess
+        Variable layout (N_cap + 11T, T binaries at the end):
+          [c_solar, c_wind, batt_power (, batt_energy), c_gas |
+           charge discharge soc gas_gen grid_buy grid_sell
+           curtail_pv curtail_wl cfe_excess | w on]
+        Constraints (13T): 2T equalities + 11T inequalities.
         """
         from scipy.sparse import eye as speye, diags, hstack, vstack, csr_matrix
         from scipy.optimize import milp, LinearConstraint, Bounds
 
-        T     = self.demand.HOURS
-        d     = self.demand.demand_mw
-        g     = self.demand.grid_cap_mw
-        p     = self.prices
-        M     = self.cfe_penalty
+        T      = self.demand.HOURS
+        d      = self.demand.demand_mw
+        g      = self.demand.grid_cap_mw
+        p      = self.prices
+        M      = self.cfe_penalty
+        sh     = self.storage_hours
+        free_e = (sh is None)
+        N_cap  = (5 if free_e else 4)   # c_solar, c_wind, batt_power (, batt_energy), c_gas
+        C_max  = d                       # big-M upper bound on c_gas
+        sf     = self.demand.HOURS / _FULL_YEAR_HOURS
+
+        # ── cost coefficients ─────────────────────────────────────────────────
+        c_solar_coef = ((self.solar_tech.capex * self.solar_tech.crf + self.solar_tech.opex_fixed) * sf
+                        + self.solar_tech.opex_var * float(self.solar_cf.sum()))
+        c_wind_coef  = ((self.wind_tech.capex * self.wind_tech.crf + self.wind_tech.opex_fixed) * sf
+                        + self.wind_tech.opex_var * float(self.wind_cf.sum()))
+        c_gas_coef   = (self.gas_tech.capex * self.gas_tech.crf + self.gas_tech.opex_fixed) * sf
+
+        if free_e:
+            cap_costs = [c_solar_coef, c_wind_coef,
+                         (self.battery.capex_power * self.battery.crf + self.battery.opex_fixed) * sf,
+                         self.battery.capex_energy * self.battery.crf * sf,
+                         c_gas_coef]
+        else:
+            cap_costs = [c_solar_coef, c_wind_coef,
+                         ((self.battery.capex_power + self.battery.capex_energy * sh) * self.battery.crf
+                          + self.battery.opex_fixed) * sf,
+                         c_gas_coef]
+
+        c_obj = np.concatenate([
+            cap_costs,
+            np.zeros(3 * T),
+            np.full(T, self.gas_tech.opex_var),
+            p + self.buy_tariff,
+            -p + self.sell_tariff,
+            np.zeros(T),
+            np.full(T, -self.wind_tech.opex_var),
+            np.full(T, M),
+            np.zeros(2 * T),      # w, on: no direct cost
+        ])
+
+        # ── sparse blocks ─────────────────────────────────────────────────────
+        I  = speye(T, format='csr')
+        Z  = csr_matrix((T, T))
+        L  = (diags([np.ones(T), -np.ones(T - 1)], [0, -1], shape=(T, T), format='csr')
+              + csr_matrix(([-1.0], ([0], [T - 1])), shape=(T, T)))
+        Zc = csr_matrix((T, N_cap))
+
         eta_c = self.battery.eta_charge
         eta_d = self.battery.eta_discharge
 
-        pv_gen = c_solar * self.solar_cf
-        wl_gen = c_wind  * self.wind_cf
+        # column slices for capacity variables
+        cf_cols = [-self.solar_cf, -self.wind_cf] + [np.zeros(T)] * (N_cap - 2)
+        pw      = np.zeros((T, N_cap)); pw[:, 2]                        = -1.0
+        en      = np.zeros((T, N_cap)); en[:, 3 if free_e else 2]       = -1.0 if free_e else -sh
+        pv_cap  = np.zeros((T, N_cap)); pv_cap[:, 0]                    = -self.solar_cf
+        wl_cap  = np.zeros((T, N_cap)); wl_cap[:, 1]                    = -self.wind_cf
+        mc2_cap = np.zeros((T, N_cap)); mc2_cap[:, -1]                  = -1.0
+        mc3_cap = np.zeros((T, N_cap)); mc3_cap[:, -1]                  =  1.0
 
-        I = speye(T, format='csr')
-        Z = csr_matrix((T, T))
-        L = (diags([np.ones(T), -np.ones(T - 1)], [0, -1], shape=(T, T), format='csr')
-             + csr_matrix(([-1.0], ([0], [T - 1])), shape=(T, T)))
+        # ── constraint matrices ───────────────────────────────────────────────
+        # cols: [N_cap | charge discharge soc gas_gen grid_buy grid_sell cpv cwl cfe | w on]
+        A_en    = hstack([csr_matrix(np.column_stack(cf_cols)),
+                          I, -I, Z, -I, -I, I, I, I, Z, Z, Z], format='csr')
+        A_soc   = hstack([Zc, -eta_c*I, (1/eta_d)*I, L, Z, Z, Z, Z, Z, Z, Z, Z], format='csr')
+        A_cfe   = hstack([Zc, Z, Z, Z, Z, I, Z, Z, Z, -I, Z, Z], format='csr')
+        A_chr   = hstack([csr_matrix(pw), I, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z], format='csr')
+        A_dis   = hstack([csr_matrix(pw), Z, I, Z, Z, Z, Z, Z, Z, Z, Z, Z], format='csr')
+        A_soc_  = hstack([csr_matrix(en), Z, Z, I, Z, Z, Z, Z, Z, Z, Z, Z], format='csr')
+        A_cpv   = hstack([csr_matrix(pv_cap), Z, Z, Z, Z, Z, Z, I, Z, Z, Z, Z], format='csr')
+        A_cwl   = hstack([csr_matrix(wl_cap), Z, Z, Z, Z, Z, Z, Z, I, Z, Z, Z], format='csr')
+        A_gd_up = hstack([Zc, Z, Z, Z, I, Z, Z, Z, Z, Z, -I, Z], format='csr')
+        A_gd_lo = hstack([Zc, Z, Z, Z, -I, Z, Z, Z, Z, Z, self.min_load * I, Z], format='csr')
+        A_mc1   = hstack([Zc, Z, Z, Z, Z, Z, Z, Z, Z, Z, I, -C_max * I], format='csr')
+        A_mc2   = hstack([csr_matrix(mc2_cap), Z, Z, Z, Z, Z, Z, Z, Z, Z, I, Z], format='csr')
+        A_mc3   = hstack([csr_matrix(mc3_cap), Z, Z, Z, Z, Z, Z, Z, Z, Z, -I, C_max * I], format='csr')
 
-        c_obj = np.concatenate([
-            np.zeros(T),                              # on
-            np.zeros(3 * T),                          # charge, discharge, soc
-            np.full(T, self.gas_tech.opex_var),       # gas_gen
-            p + self.buy_tariff,                      # grid_buy
-            -p + self.sell_tariff,                    # grid_sell
-            np.zeros(T),                              # curtail_pv
-            np.full(T, -self.wind_tech.opex_var),     # curtail_wl
-            np.full(T, M),                            # cfe_excess
-        ])
+        A = vstack([A_en, A_soc,
+                    A_cfe, A_chr, A_dis, A_soc_, A_cpv, A_cwl,
+                    A_gd_up, A_gd_lo, A_mc1, A_mc2, A_mc3], format='csr')
 
-        lb = np.zeros(10 * T)
-        ub = np.empty(10 * T)
-        ub[0*T:1*T] = 1.0;         ub[1*T:2*T] = batt_power
-        ub[2*T:3*T] = batt_power;  ub[3*T:4*T] = batt_energy
-        ub[4*T:5*T] = c_gas;       ub[5*T:6*T] = d
-        ub[6*T:7*T] = g;           ub[7*T:8*T] = pv_gen
-        ub[8*T:9*T] = wl_gen;      ub[9*T:]    = np.inf
+        lb_con = np.concatenate([np.full(T, -d), np.zeros(T), np.full(11 * T, -np.inf)])
+        ub_con = np.concatenate([np.full(T, -d), np.zeros(T),
+                                  np.full(T, g), np.zeros(9 * T), np.full(T, C_max)])
 
-        integrality = np.zeros(10 * T); integrality[:T] = 1   # on[t] binary
+        off = N_cap
+        lb_var = np.zeros(N_cap + 11 * T)
+        ub_var = np.full(N_cap + 11 * T, np.inf)
+        ub_var[0] = self.max_solar_mw if self.max_solar_mw is not None else np.inf
+        ub_var[1] = self.max_wind_mw  if self.max_wind_mw  is not None else np.inf
+        # when both caps are set, fix VE at their caps; HiGHS presolve eliminates them
+        # and tightens the LP relaxation at every B&B node
+        if self.max_solar_mw is not None:
+            lb_var[0] = self.max_solar_mw
+        if self.max_wind_mw is not None:
+            lb_var[1] = self.max_wind_mw
+        ub_var[off + 3*T : off + 4*T]  = d      # gas_gen
+        ub_var[off + 4*T : off + 5*T]  = d      # grid_buy
+        ub_var[off + 5*T : off + 6*T]  = g      # grid_sell
+        ub_var[off + 9*T : off + 10*T] = C_max  # w
+        ub_var[off + 10*T :]            = 1.0   # on
 
-        # Energy balance (T, equality)
-        A_bal    = hstack([Z, I, -I, Z, -I, -I, I, I, I, Z], format='csr')
-        rhs_bal  = -d + pv_gen + wl_gen
-        # SOC recurrence (T, equality)
-        A_soc    = hstack([Z, -eta_c * I, (1.0 / eta_d) * I, L, Z, Z, Z, Z, Z, Z], format='csr')
-        # CFE (T, ≤ g)
-        A_cfe    = hstack([Z, Z, Z, Z, Z, I, Z, Z, Z, -I], format='csr')
-        # Gas on/off upper (T, ≤ 0): gas_gen ≤ c_gas*on
-        A_gas_up = hstack([-c_gas * I, Z, Z, Z, I, Z, Z, Z, Z, Z], format='csr')
-        # Gas min load (T, ≤ 0): gas_gen ≥ min_load*c_gas*on
-        A_gas_lo = hstack([self.min_load * c_gas * I, Z, Z, Z, -I, Z, Z, Z, Z, Z], format='csr')
-
-        A      = vstack([A_bal, A_soc, A_cfe, A_gas_up, A_gas_lo], format='csr')
-        lb_con = np.concatenate([rhs_bal, np.zeros(T), np.full(3 * T, -np.inf)])
-        ub_con = np.concatenate([rhs_bal, np.zeros(T),
-                                 np.full(T, g), np.zeros(T), np.zeros(T)])
+        integrality = np.zeros(N_cap + 11 * T)
+        integrality[N_cap + 10*T:] = 1          # on[t] binary
 
         res = milp(c_obj, constraints=LinearConstraint(A, lb_con, ub_con),
-                   integrality=integrality, bounds=Bounds(lb, ub))
+                   integrality=integrality, bounds=Bounds(lb_var, ub_var),
+                   options={'mip_rel_gap': 0.10, 'disp': True})
         if res.status != 0:
-            raise RuntimeError(f"MILP dispatch failed (status {res.status}): {res.message}")
+            return None
 
-        x = res.x
+        print(f"MILP gap at termination: {res.mip_gap:.2%}  (nodes: {res.mip_node_count:,})")
+
+        x   = res.x
+        c_s = float(x[0]);  c_w = float(x[1]);  b_p = float(x[2])
+        b_e = float(x[3]) if free_e else sh * b_p
+        c_g = float(x[N_cap - 1])
+
         return {
-            'on':         x[0*T:1*T],
-            'charge':     x[1*T:2*T],
-            'discharge':  x[2*T:3*T],
-            'soc':        x[3*T:4*T],
-            'gas_gen':    x[4*T:5*T],
-            'grid_buy':   x[5*T:6*T],
-            'grid_sell':  x[6*T:7*T],
-            'curtail_pv': x[7*T:8*T],
-            'curtail_wl': x[8*T:9*T],
-            'curtail':    x[7*T:8*T] + x[8*T:9*T],
-            'cfe_excess': x[9*T:10*T],
-            'milp_obj':   float(res.fun),
+            'c_solar':     c_s,
+            'c_wind':      c_w,
+            'batt_power':  b_p,
+            'batt_energy': b_e,
+            'c_gas':       c_g,
+            'charge':      x[off + 0*T : off + 1*T],
+            'discharge':   x[off + 1*T : off + 2*T],
+            'soc':         x[off + 2*T : off + 3*T],
+            'gas_gen':     x[off + 3*T : off + 4*T],
+            'grid_buy':    x[off + 4*T : off + 5*T],
+            'grid_sell':   x[off + 5*T : off + 6*T],
+            'curtail_pv':  x[off + 6*T : off + 7*T],
+            'curtail_wl':  x[off + 7*T : off + 8*T],
+            'curtail':     x[off + 6*T : off + 7*T] + x[off + 7*T : off + 8*T],
+            'cfe_excess':  x[off + 8*T : off + 9*T],
+            'on':          x[off + 10*T : off + 11*T],
+            'milp_obj':    float(res.fun),
+            'mip_gap':     float(res.mip_gap),
+            'pv_gen':      c_s * self.solar_cf,
+            'wl_gen':      c_w * self.wind_cf,
         }
 
     def lp_detail(self) -> dict | None:
-        """Capacities from LP; if min_load > 0, dispatch is resolved as MILP."""
         if self._lp_cache is None:
-            lp = self._single_lp()
-            if lp is not None and self.min_load > 0:
-                milp_disp = self._dispatch_milp(
-                    lp['c_solar'], lp['c_wind'], lp['batt_power'], lp['batt_energy'], lp['c_gas']
-                )
-                lp.update(milp_disp)   # overwrites dispatch arrays; keeps LP capacities
-            self._lp_cache = lp
+            self._lp_cache = self._single_lp()
         return self._lp_cache
 
     @property
