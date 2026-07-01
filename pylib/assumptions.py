@@ -33,8 +33,8 @@ SMR_DOWNTIME = 0.10   # planned maintenance fraction of year (one contiguous blo
 
 # ── solar PV (utility-scale) ──────────────────────────────────────────────────
 
-SOLAR_LAND_HA_PER_MW   = 10.0    # ha/MW total site area  [DEA 2030]
-SOLAR_LAND_RENT_DKK_HA = 3_581   # DKK/ha/yr  [ET] — gives 4,800 €/MW/yr at 10 ha/MW
+SOLAR_LAND_HA_PER_MW   = 1.593   # ha/MW  [DEA 2030: 15.93 × 1000 m²/MW_e]
+SOLAR_LAND_RENT_DKK_HA = 3_581   # DKK/ha/yr  [DEA 2030] — gives 4,800 €/MW/yr at 10 ha/MW
 
 _solar_land_eur_mw_yr = SOLAR_LAND_HA_PER_MW * SOLAR_LAND_RENT_DKK_HA / DKK_EUR  # ≈ 4,800
 
